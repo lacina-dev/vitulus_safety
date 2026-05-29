@@ -1,0 +1,6 @@
+<launch>
+    <node name="safety_node" pkg="vitulus_safety" type="safety_node.py"
+          respawn="true" respawn_delay="5" output="screen">
+        <rosparam file="$(find vitulus_safety)/config/safety.yaml" command="load"/>
+    </node>
+</launch>

@@ -1,0 +1,17 @@
+# Safety node configuration
+
+# IMU tilt limits (degrees)
+max_tilt_x: 30.0
+max_tilt_y: 30.0
+
+# Motor monitoring
+motor_timeout: 2.0          # seconds without state message to consider motor dead
+motor_check_rate: 5.0       # Hz - how often to check motor states
+startup_grace: 10.0         # seconds after start to skip motor checks (system boot time)
+
+# Temperature limits (Celsius)
+motor_max_temp: 70.0        # max drive motor temperature before shutdown
+mower_max_temp: 70.0        # max mower motor temperature before shutdown
+
+# Alarm melody ID for power module buzzer
+alarm_melody: 4

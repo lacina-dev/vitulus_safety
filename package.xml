@@ -1,0 +1,14 @@
+<package format="2">
+  <name>vitulus_safety</name>
+  <version>0.1.0</version>
+  <description>Safety monitoring node for Vitulus robot.</description>
+
+  <maintainer email="robert@lacina.dev">Robert Lacina</maintainer>
+  <license>MIT</license>
+
+  <buildtool_depend>catkin</buildtool_depend>
+  <depend>rospy</depend>
+  <depend>std_msgs</depend>
+  <depend>sensor_msgs</depend>
+  <depend>vitulus_msgs</depend>
+</package>
