@@ -87,3 +87,36 @@ Parameters are loaded from `config/safety.yaml` via the launch file. Edit values
 ## License
 
 MIT
+
+## Node: `lidar_objects` (optional)
+
+Detects larger moving objects (cat / dog / person) from the 2D lidar. Read-only:
+it subscribes to `/scan` and wheel odometry and controls nothing.
+
+How it decides: a 60 s rolling **median** per beam is the static background, so
+walls, the dock and a parked car sink into it. Foreground = beams clearly closer
+than the background (max of 0.20 m and 6 % of range). Foreground points are
+clustered (gap threshold grows with range), kept only when 0.15–1.2 m wide with
+enough points for that distance, tracked between scans (nearest neighbour, id,
+speed) and reported only after 3 consecutive scans (~0.3 s). A single flickering
+beam therefore never becomes an object.
+
+Topics:
+
+- `/safety/lidar_objects` — `std_msgs/String` JSON @ 5 Hz:
+  `{stamp, count, frame_id, moving, background_ready, objects:[{id, cls, x, y,
+  size, speed, age_s, bearing_deg, range_m}]}`; `cls` is a coarse guess from
+  size and speed: `small` (cat), `medium` (dog), `large` (person), `unknown`.
+- `/safety/lidar_objects_markers` — `visualization_msgs/MarkerArray` for RViz.
+
+Run it:
+
+```bash
+roslaunch vitulus_safety safety.launch lidar_objects:=true   # needs catkin_make
+python3 nodes/lidar_objects.py                               # no build needed
+```
+
+Parameters live in `config/lidar_objects.yaml`. While the robot drives, the
+static background is meaningless, so it is dropped and nothing is reported.
+
+Unit test with synthetic scans: `python3 test/test_lidar_objects.py`.

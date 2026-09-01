@@ -6,14 +6,19 @@ find_package(catkin REQUIRED COMPONENTS
   std_msgs
   sensor_msgs
   vitulus_msgs
+  nav_msgs
+  geometry_msgs
+  visualization_msgs
+  tf2_ros
 )
 
 catkin_package(
-  CATKIN_DEPENDS rospy std_msgs sensor_msgs vitulus_msgs
+  CATKIN_DEPENDS rospy std_msgs sensor_msgs vitulus_msgs nav_msgs geometry_msgs visualization_msgs tf2_ros
 )
 
 catkin_install_python(PROGRAMS
   nodes/safety_node.py
+  nodes/lidar_objects.py
   DESTINATION ${CATKIN_PACKAGE_BIN_DESTINATION}
 )
 

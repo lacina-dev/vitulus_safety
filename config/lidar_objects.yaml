@@ -1,0 +1,44 @@
+# lidar_objects — detekce větších pohyblivých objektů (kočka / pes / člověk)
+# Všechny hodnoty jdou přepsat i za běhu přes rosparam + restart uzlu.
+
+scan_topic: /scan
+odom_topic: /mobile_base_controller/odom
+target_frame: base_link
+publish_rate: 5.0             # Hz na /safety/lidar_objects
+publish_markers: true
+
+# Statické pozadí (klouzavý medián vzdálenosti per paprsek)
+bg_window_s: 60.0             # co v obraze vydrží déle, stane se pozadím
+bg_sample_dt: 0.5             # jak často se scan ukládá do okna
+bg_min_samples: 10            # dokud jich není tolik, nedetekuje se nic
+
+# Popředí = paprsek výrazně blíž než pozadí
+fg_margin_m: 0.20             # absolutní mez
+fg_margin_frac: 0.06          # relativní mez (bere se max z obou)
+fg_max_range_m: 10.0
+fg_min_range_m: 0.15
+
+# Shlukování popředí
+cluster_gap_m: 0.18
+cluster_gap_k: 3.0            # práh mezery roste s dosahem (r × Δθ)
+
+# Filtr kandidátů
+min_size_m: 0.15              # kočka
+max_size_m: 1.20              # člověk / velký pes; větší = zeď, auto
+min_points_floor: 2
+min_points_near: 4
+near_range_m: 3.0
+
+# Sledování mezi scany
+assoc_dist_m: 0.60
+confirm_frames: 3             # trvání ~0,3 s při 10 Hz lidaru
+max_missed: 3
+speed_alpha: 0.4
+max_speed_mps: 4.0
+
+# Hrubá klasifikace podle šířky (a rychlosti)
+cls_small_max_m: 0.30         # < small (kočka)
+cls_medium_max_m: 0.60        # < medium (pes), výš large (člověk)
+
+# Za jízdy robota je statické pozadí neplatné — nad tuhle rychlost se resetuje
+motion_speed_mps: 0.05
