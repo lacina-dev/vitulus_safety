@@ -183,12 +183,37 @@ def test_f_still_object_is_still_not_moving():
     print('F) stojící objekt: motion=still, v=%.2f m/s  OK' % o['speed'])
 
 
+def test_g_sectors_and_noise_adaptive_threshold():
+    """Orientace (x = předek): sektory; a klidový rozptyl zvedne práh —
+    vlnění ±8 cm na jednom místě NEdá popředí, člověk dá."""
+    from lidar_objects import sector_of
+    assert sector_of(10) == 'front' and sector_of(-30) == 'front'
+    assert sector_of(90) == 'left' and sector_of(-90) == 'right'
+    assert sector_of(170) == 'back' and sector_of(-170) == 'back'
+    rng = random.Random(3)
+    # garáž, kde jeden úsek stěny (30 paprsků) v klidu „dýchá" ±8 cm
+    def calm(t, rng=rng):
+        r = garage(0.01, rng)
+        r[400:430] = WALL + (rng.random() * 2 - 1) * 0.08
+        return r
+    frames = [calm for _ in range(300)]
+    det, res = run(frames)
+    assert all(len(x) == 0 for x in res[-50:]), 'dýchající stěna nesmí být objekt'
+    nz = det.noise()
+    assert nz.get('mad_median_m', 1) < 0.03, 'klid: medián MAD malý (%s)' % nz
+    person = [(lambda t, rng=rng: put_object(calm(t), 2.0, 0.3, 0.45)) for _ in range(20)]
+    det2, res2 = run(frames + person)
+    assert len(res2[-1]) == 1 and res2[-1][0]['sector'] == 'front', 'člověk vpředu se pozná: %s' % res2[-1]
+    print('G) sektory OK; dýchající stěna ±8 cm → 0 objektů, klid MAD %.3f m; člověk vpředu → 1 objekt front  OK' % nz['mad_median_m'])
+
+
 if __name__ == '__main__':
     fails = 0
     for fn in (test_a_empty_garage_noise, test_b_moving_object,
                test_c_static_object_ages_into_background,
                test_d_single_beam_flicker, test_e_motion_tracking_and_events,
-               test_f_still_object_is_still_not_moving):
+               test_f_still_object_is_still_not_moving,
+               test_g_sectors_and_noise_adaptive_threshold):
         try:
             fn()
         except AssertionError as e:

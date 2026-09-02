@@ -27,6 +27,7 @@ import json
 import math
 import os
 import threading
+import time
 
 import numpy as np
 import rospy
@@ -34,7 +35,7 @@ import tf2_ros
 from geometry_msgs.msg import Point
 from nav_msgs.msg import Odometry
 from sensor_msgs.msg import LaserScan
-from std_msgs.msg import String
+from std_msgs.msg import Bool, String
 from visualization_msgs.msg import Marker, MarkerArray
 
 
@@ -43,6 +44,23 @@ from visualization_msgs.msg import Marker, MarkerArray
 # --------------------------------------------------------------------------
 
 DEFAULTS = {
+    # KLID → PRÁH.  Majitel (2. 9.): „charakterizuj ty změny, co se tam dějou
+    # v klidu, a odfiltruj je; až tam přijdu, bude to větší změna."  Rozptyl
+    # každého paprsku (MAD z bufferu pozadí) je změřený klid; popředí musí
+    # být `noise_k`× větší.  Klidové statistiky se hlásí v payloadu (`noise`).
+    'noise_k': 5.0,             # popředí = blíž o víc než noise_k × MAD paprsku
+    'noise_floor_m': 0.05,      # MAD pod tím se bere jako 5 cm (lidar sám)
+    # JEN KDYŽ STOJÍ.  Detekce běží bez pohybu (odom) a po `still_s` klidu;
+    # v doku (`/dock_manager/is_in_dock_confirmed`) hned.
+    'still_s': 10.0,
+    # ÚSPORA: v klidu se zpracuje každý `idle_every`-tý scan; po detekci
+    # (nebo události) plné tempo na `boost_s` sekund.
+    'idle_every': 3,
+    'boost_s': 30.0,
+    # SNÍMKY při události: adresář, kamera pro objekt vpředu.
+    'snapshot_dir': '~/.vitulus/lidar_events',
+    'camera_topic': '/d435/color/image_raw/compressed',
+    'camera_front_deg': 60.0,   # |bearing| pod tím = „vpředu", má smysl kamera
     'still_mps': 0.15,          # pod tim je objekt v klidu (sum zakmitu shluku ~0,1 m/s)
     # pozadí
     'bg_window_s': 60.0,        # délka okna klouzavého mediánu
@@ -74,6 +92,18 @@ DEFAULTS = {
     # jízda
     'motion_speed_mps': 0.05,   # nad tuhle rychlost robota je pozadí neplatné
 }
+
+
+def sector_of(bearing_deg):
+    """ORIENTACE.  `base_link`: x = PŘEDEK robota, y = vlevo (ROS REP-103).
+    V doku robot couvá dovnitř, takže předek míří VEN — do garáže/k vratům.
+    Sektory: front |b|<45°, left 45..135°, back |b|>135°, right −45..−135°."""
+    b = ((bearing_deg + 180.0) % 360.0) - 180.0
+    if abs(b) < 45.0:
+        return 'front'
+    if abs(b) > 135.0:
+        return 'back'
+    return 'left' if b > 0 else 'right'
 
 
 class Track(object):
@@ -218,8 +248,22 @@ class ObjectDetector(object):
                 # nanmedian: paprsek, který je občas inf (nic nezasáhl), se
                 # počítá jen z platných měření; když nikdy nic nevrátil, zůstane NaN
                 self._bg_median = np.nanmedian(self._bg_buf[:self._bg_n, :], axis=0)
+                # KLID: medián absolutní odchylky per paprsek — kolik se to
+                # v klidu vlní.  ×1,4826 ≈ směrodatná odchylka.
+                dev = np.abs(self._bg_buf[:self._bg_n, :] - self._bg_median)
+                self._bg_mad = np.nanmedian(dev, axis=0) * 1.4826
             self._bg_dirty = False
         return self._bg_median
+
+    def noise(self):
+        """Klidové statistiky (pro payload i pro ladění prahů)."""
+        mad = getattr(self, '_bg_mad', None)
+        if mad is None or not np.isfinite(mad).any():
+            return {}
+        fin = mad[np.isfinite(mad)]
+        return {'mad_median_m': round(float(np.median(fin)), 3),
+                'mad_p95_m': round(float(np.percentile(fin, 95)), 3),
+                'fg_points_p95': int(getattr(self, '_fg_p95', 0))}
 
     # -- jeden scan -------------------------------------------------------
     def process(self, ranges, angle_min, angle_inc, stamp, range_max=None):
@@ -241,9 +285,25 @@ class ObjectDetector(object):
         self._track(clusters, stamp)
         return self.confirmed()
 
+    def _note_fg(self, n):
+        hist = getattr(self, '_fg_hist', None)
+        if hist is None:
+            hist = self._fg_hist = []
+        hist.append(int(n))
+        if len(hist) > 600:
+            del hist[:-600]
+        if len(hist) >= 20:
+            self._fg_p95 = int(np.percentile(hist, 95))
+
     def _foreground_mask(self, r, bg):
         cfg = self.cfg
         margin = np.maximum(cfg['fg_margin_m'], cfg['fg_margin_frac'] * bg)
+        mad = getattr(self, '_bg_mad', None)
+        if mad is not None:
+            with np.errstate(invalid='ignore'):
+                sigma = np.where(np.isfinite(mad), np.maximum(mad, cfg['noise_floor_m']),
+                                 cfg['noise_floor_m'])
+            margin = np.maximum(margin, cfg['noise_k'] * sigma)
         valid = np.isfinite(r) & (r > cfg['fg_min_range_m']) & (r < cfg['fg_max_range_m'])
         # paprsek bez pozadí (vždycky inf, teď něco vidí) je taky popředí
         no_bg = ~np.isfinite(bg)
@@ -254,6 +314,7 @@ class ObjectDetector(object):
         cfg = self.cfg
         mask = self._foreground_mask(r, bg)
         idx = np.nonzero(mask)[0]
+        self._note_fg(idx.size)
         if idx.size == 0:
             return []
         ang = self._angles[idx]
@@ -323,7 +384,10 @@ class ObjectDetector(object):
                 self.events.append({'type': 'left', 'id': t.id,
                                     'cls': self.classify(t),
                                     'x': round(t.x, 2), 'y': round(t.y, 2),
+                                    'sector': sector_of(math.degrees(math.atan2(t.y, t.x))),
                                     'seen_s': round(t.age_s, 1),
+                                    'motion': t.motion(),
+                                    'path': list(t.path),
                                     'stamp': round(stamp, 2)})
         self.tracks = [t for t in self.tracks if t.missed <= cfg['max_missed']]
         for c in free:
@@ -357,6 +421,8 @@ class ObjectDetector(object):
                 self.events.append({'type': 'appeared', 'id': t.id,
                                     'cls': self.classify(t),
                                     'x': round(t.x, 2), 'y': round(t.y, 2),
+                                    'sector': sector_of(math.degrees(math.atan2(t.y, t.x))),
+                                    'range_m': round(math.hypot(t.x, t.y), 2),
                                     'stamp': round(t.last_seen, 2)})
             out.append({
                 'id': t.id,
@@ -368,6 +434,7 @@ class ObjectDetector(object):
                 'age_s': round(t.age_s, 1),
                 'bearing_deg': round(math.degrees(math.atan2(t.y, t.x)), 1),
                 'range_m': round(math.hypot(t.x, t.y), 2),
+                'sector': sector_of(math.degrees(math.atan2(t.y, t.x))),
                 # pohyb
                 'motion': t.motion(cfg.get('still_mps', 0.15)),
                 'heading_deg': t.heading_deg,
@@ -399,6 +466,14 @@ class LidarObjectsNode(object):
         self.objects = []
         self.events = []             # appeared/left, vyzvedne cb_publish
         self.moving = False
+        self.docked = False
+        self.still_since = None       # od kdy robot stojí (odom)
+        self._scan_i = 0              # počítadlo scanů pro decimaci
+        self._boost_until = 0.0       # do kdy plné tempo
+        self._last_ranges = None      # poslední scan pro snímek
+        self._last_scan_meta = None
+        self.snapshot_dir = os.path.expanduser(rospy.get_param('~snapshot_dir', cfg['snapshot_dir']))
+        self.camera_topic = rospy.get_param('~camera_topic', cfg['camera_topic'])
         self.last_scan_stamp = None
         self.scan_frame = None
         self._tf = (0.0, 0.0, 0.0)     # base_link ← scan_frame (x, y, yaw)
@@ -412,6 +487,7 @@ class LidarObjectsNode(object):
                                            MarkerArray, queue_size=1)
         rospy.Subscriber(self.scan_topic, LaserScan, self.cb_scan, queue_size=1)
         rospy.Subscriber(self.odom_topic, Odometry, self.cb_odom, queue_size=1)
+        rospy.Subscriber('/dock_manager/is_in_dock_confirmed', Bool, self.cb_dock, queue_size=1)
         rospy.Timer(rospy.Duration(1.0 / max(0.5, self.publish_rate)), self.cb_publish)
         rospy.Timer(rospy.Duration(10.0), self.cb_master)
         rospy.loginfo('lidar_objects: scan=%s odom=%s bg_window=%.0fs confirm=%d',
@@ -428,12 +504,36 @@ class LidarObjectsNode(object):
                 # Za jízdy je "statické pozadí" nesmysl — radši nic než 117 duchů.
                 self.det.reset()
                 self.objects = []
+                self.still_since = None
+            elif not moving and self.still_since is None:
+                self.still_since = rospy.get_time()
             self.moving = moving
+
+    def cb_dock(self, msg):
+        with self.lock:
+            self.docked = bool(msg.data)
+
+    def _active(self, now):
+        """Detekce jen když robot STOJÍ — ideálně v doku (majitel 2. 9.).
+        V doku hned; jinak po `still_s` klidu podle odometrie."""
+        if self.moving:
+            return False
+        if self.docked:
+            return True
+        return self.still_since is not None and (now - self.still_since) >= self.det.cfg['still_s']
 
     def cb_scan(self, msg):
         with self.lock:
-            if self.moving:
+            now = rospy.get_time()
+            if not self._active(now):
                 self.last_scan_stamp = msg.header.stamp.to_sec()
+                self.objects = []
+                return
+            # ÚSPORA: v klidu každý `idle_every`-tý scan; při detekci/události
+            # plné tempo (`boost_s`) — „zintenzivnit monitoring".
+            self._scan_i += 1
+            boosted = now < self._boost_until or bool(self.det.tracks)
+            if not boosted and (self._scan_i % max(1, int(self.det.cfg['idle_every']))):
                 return
             if self.scan_frame != msg.header.frame_id:
                 self.scan_frame = msg.header.frame_id
@@ -444,10 +544,110 @@ class LidarObjectsNode(object):
                                     msg.angle_increment, stamp,
                                     range_max=msg.range_max)
             self.objects = [self._to_base_link(o) for o in objs]
-            self.events.extend(self.det.take_events())
+            nove = self.det.take_events()
+            if nove or objs:
+                self._boost_until = now + float(self.det.cfg['boost_s'])
+            self._last_ranges = np.array(msg.ranges, dtype=np.float64)
+            self._last_scan_meta = (msg.angle_min, msg.angle_increment, stamp)
+            for e in nove:
+                self._snapshot_async(e, list(self.objects))
+            self.events.extend(nove)
             if len(self.events) > 50:
                 del self.events[:-50]
             self.last_scan_stamp = stamp
+
+    # -- zintenzivnění při detekci: zápis události + obrázky ---------------
+    def _snapshot_async(self, event, objs):
+        t = threading.Thread(target=self._snapshot, args=(event, objs),
+                             name='lo-snapshot', daemon=True)
+        t.start()
+
+    def _snapshot(self, event, objs):
+        """Událost do JSONL + PNG scanu s objektem + (vpředu) snímek kamery.
+        Běží ve vlákně, ať nezdržuje scan.  Chyby jen zaloguje."""
+        try:
+            os.makedirs(self.snapshot_dir, exist_ok=True)
+            stamp = float(event.get('stamp') or rospy.get_time())
+            base = '%s_%s_%s' % (time.strftime('%Y%m%d-%H%M%S', time.localtime(stamp)),
+                                 event.get('type'), event.get('id'))
+            paths = {}
+            png = os.path.join(self.snapshot_dir, base + '.png')
+            if self._render_scan(png, objs, event):
+                paths['scan_png'] = png
+            if (event.get('type') == 'appeared'
+                    and event.get('sector') == 'front'):
+                jpg = os.path.join(self.snapshot_dir, base + '.jpg')
+                if self._grab_camera(jpg):
+                    paths['camera_jpg'] = jpg
+            rec = dict(event)
+            rec.update({'snapshot': paths, 'objects': objs,
+                        'noise': self.det.noise(), 'docked': self.docked})
+            with open(os.path.join(self.snapshot_dir, 'events.jsonl'), 'a') as fh:
+                fh.write(json.dumps(rec, ensure_ascii=False) + '\n')
+            event['snapshot'] = paths
+            rospy.loginfo('lidar_objects: událost %s #%s %s %s m — %s',
+                          event.get('type'), event.get('id'), event.get('sector'),
+                          event.get('range_m', '?'), ', '.join(paths.values()) or 'bez snímku')
+        except Exception as exc:                                # noqa: BLE001
+            rospy.logwarn('lidar_objects: snímek události selhal: %s', exc)
+
+    def _render_scan(self, path, objs, event, size=480, span_m=6.0):
+        """PNG: scan shora (předek nahoru), sektory, objekty s třídou/pohybem."""
+        try:
+            from PIL import Image, ImageDraw
+        except ImportError:
+            return False
+        with self.lock:
+            r = self._last_ranges
+            meta = self._last_scan_meta
+        if r is None or meta is None:
+            return False
+        a0, inc, _st = meta
+        img = Image.new('RGB', (size, size), (18, 24, 30))
+        d = ImageDraw.Draw(img)
+        c = size / 2.0
+        k = c / span_m
+        def px(x, y):                       # base_link: x vpřed (nahoru), y vlevo (doleva)
+            return (c - y * k, c - x * k)
+        for m in (1, 2, 3, 4, 5):
+            d.ellipse([c - m * k, c - m * k, c + m * k, c + m * k], outline=(40, 52, 62))
+        for ang, lab in ((0, 'FRONT'), (90, 'LEFT'), (180, 'BACK'), (-90, 'RIGHT')):
+            ex, ey = px(5.5 * math.cos(math.radians(ang)), 5.5 * math.sin(math.radians(ang)))
+            d.text((ex - 16, ey - 6), lab, fill=(120, 140, 160))
+        for i, rr in enumerate(r):
+            if not np.isfinite(rr) or rr <= 0.05 or rr > span_m:
+                continue
+            ang = a0 + i * inc
+            x, y = rr * math.cos(ang), rr * math.sin(ang)
+            tx, ty, tyaw = self._tf
+            xb = tx + x * math.cos(tyaw) - y * math.sin(tyaw)
+            yb = ty + x * math.sin(tyaw) + y * math.cos(tyaw)
+            X, Y = px(xb, yb)
+            d.point((X, Y), fill=(220, 200, 80))
+        for o in objs:
+            X, Y = px(o['x'], o['y'])
+            rad = max(4, o.get('size', 0.3) * k / 2)
+            col = (255, 80, 80) if o.get('id') == event.get('id') else (255, 160, 60)
+            d.ellipse([X - rad, Y - rad, X + rad, Y + rad], outline=col, width=2)
+            d.text((X + rad + 2, Y - 6), '%s %s %.1fm' % (o.get('cls'), o.get('motion', ''), o.get('range_m', 0)), fill=col)
+        d.polygon([px(0.25, 0), px(-0.15, 0.15), px(-0.15, -0.15)], fill=(80, 200, 120))
+        d.text((6, 6), '%s #%s %s' % (event.get('type'), event.get('id'),
+                                       time.strftime('%d.%m. %H:%M:%S', time.localtime(float(event.get('stamp') or 0)))),
+               fill=(200, 200, 200))
+        img.save(path)
+        return True
+
+    def _grab_camera(self, path, timeout_s=2.0):
+        """Jeden snímek z kamery (CompressedImage → JPEG na disk)."""
+        try:
+            from sensor_msgs.msg import CompressedImage
+            msg = rospy.wait_for_message(self.camera_topic, CompressedImage, timeout=timeout_s)
+            with open(path, 'wb') as fh:
+                fh.write(bytes(msg.data))
+            return True
+        except Exception as exc:                                # noqa: BLE001
+            rospy.logwarn('lidar_objects: kamera nedala snímek: %s', exc)
+            return False
 
     def _lookup_tf(self):
         if self._tf_ok or not self.scan_frame:
@@ -506,6 +706,10 @@ class LidarObjectsNode(object):
             'count': len(objs),
             'objects': objs,
             'events': events,        # appeared / left od minulé zprávy
+            'active': bool(self._active(rospy.get_time())),
+            'docked': bool(self.docked),
+            'noise': self.det.noise(),
+            'orientation': 'x=front (out of the dock), y=left; sectors front/left/back/right',
             'frame_id': frame,
             'moving': bool(moving),
             'background_ready': bool(ready),
