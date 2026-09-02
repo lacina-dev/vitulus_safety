@@ -56,6 +56,7 @@ DEFAULTS = {
     # ÚSPORA: v klidu se zpracuje každý `idle_every`-tý scan; po detekci
     # (nebo události) plné tempo na `boost_s` sekund.
     'idle_every': 3,
+    'bg_recompute_s': 5.0,      # přepočet mediánu/MAD pozadí nejvýš takhle často
     'boost_s': 30.0,
     # SNÍMKY při události: adresář, kamera pro objekt vpředu.
     'snapshot_dir': '~/.vitulus/lidar_events',
@@ -226,6 +227,7 @@ class ObjectDetector(object):
             self.background_ready = False
 
     def _push_background(self, ranges, stamp):
+        self._bg_stamp = stamp
         cfg = self.cfg
         if self._last_bg_sample is not None and \
                 (stamp - self._last_bg_sample) < cfg['bg_sample_dt']:
@@ -243,7 +245,17 @@ class ObjectDetector(object):
         self.background_ready = self._bg_n >= cfg['bg_min_samples']
 
     def _background(self):
+        # ÚSPORA: nanmedián + MAD nad (60 × 860) při každém vzorku pozadí
+        # stály ~6 % CPU (holý subscriber 0,2 %).  Pozadí se mění pomalu —
+        # přepočet nejvýš jednou za `bg_recompute_s`; do té doby platí staré.
+        # Čas ze SCANU, ne z hodin stroje: testy krmí syntetické scany
+        # rychleji než reálný čas a pozadí by se jinak nikdy nepřepočítalo.
+        now = getattr(self, '_bg_stamp', 0.0)
+        if self._bg_dirty and self._bg_n > 0 and self._bg_median is not None \
+                and now - getattr(self, '_bg_computed', -1e9) < self.cfg.get('bg_recompute_s', 5.0):
+            return self._bg_median
         if self._bg_dirty and self._bg_n > 0:
+            self._bg_computed = now
             with np.errstate(invalid='ignore'):
                 # nanmedian: paprsek, který je občas inf (nic nezasáhl), se
                 # počítá jen z platných měření; když nikdy nic nevrátil, zůstane NaN
