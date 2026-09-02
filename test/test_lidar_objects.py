@@ -135,11 +135,60 @@ def test_d_single_beam_flicker():
     print('D) zákmit jednoho paprsku: %d objektů  OK' % max(counts))
 
 
+def test_e_motion_tracking_and_events():
+    """Pohyb: objekt jde k robotu → 'approaching' + záporná radiální rychlost,
+    stopa polohy; po zmizení událost 'left', na začátku 'appeared'."""
+    rng = random.Random(5)
+    frames = warmup(rng, 30.0, 0.01)
+    moves = []
+    for k in range(40):                      # ze 3,5 m na 1,5 m, 0,5 m/s
+        def f(t, k=k, rng=rng):
+            x = 3.5 - 0.05 * k
+            return put_object(garage(0.01, rng), x, 0.0, 0.40)
+        moves.append(f)
+    gone = warmup(rng, 2.0, 0.01)
+    det = ObjectDetector({'bg_min_samples': 8})
+    events = []
+    res = []
+    for i, f in enumerate(frames + moves + gone):
+        t = i * DT
+        res.append(det.process(f(t), ANGLE_MIN, ANGLE_INC, t))
+        events.extend(det.take_events())
+    mid = res[len(frames) + 20][0]
+    assert mid['motion'] == 'approaching', 'stav %s' % mid['motion']
+    assert mid['radial_mps'] < -0.2, 'radiální %.2f' % mid['radial_mps']
+    assert mid['heading_deg'] is not None and abs(abs(mid['heading_deg']) - 180) < 30, \
+        'směr pohybu k robotu (~180°), je %s' % mid['heading_deg']
+    assert len(mid['path']) >= 5, 'stopa %d' % len(mid['path'])
+    kinds = [e['type'] for e in events]
+    assert 'appeared' in kinds and 'left' in kinds, 'události %s' % kinds
+    left = [e for e in events if e['type'] == 'left'][-1]
+    assert left['seen_s'] > 2.0, 'odešel po %.1f s' % left['seen_s']
+    assert len(res[-1]) == 0, 'po odchodu nic'
+    print('E) přiblížení 3,5→1,5 m: motion=%s, radial=%.2f m/s, heading=%s°, '
+          'stopa %d bodů; události %s  OK'
+          % (mid['motion'], mid['radial_mps'], mid['heading_deg'],
+             len(mid['path']), sorted(set(kinds))))
+
+
+def test_f_still_object_is_still_not_moving():
+    """Stojící (ale ještě nezestárlý) objekt hlásí 'still', ne šum rychlosti."""
+    rng = random.Random(9)
+    frames = warmup(rng, 30.0, 0.01)
+    stand = [(lambda t, rng=rng: put_object(garage(0.01, rng), 2.5, 0.5, 0.5))
+             for _ in range(30)]
+    det, res = run(frames + stand)
+    o = res[-1][0]
+    assert o['motion'] == 'still', 'stav %s (v=%.2f)' % (o['motion'], o['speed'])
+    print('F) stojící objekt: motion=still, v=%.2f m/s  OK' % o['speed'])
+
+
 if __name__ == '__main__':
     fails = 0
     for fn in (test_a_empty_garage_noise, test_b_moving_object,
                test_c_static_object_ages_into_background,
-               test_d_single_beam_flicker):
+               test_d_single_beam_flicker, test_e_motion_tracking_and_events,
+               test_f_still_object_is_still_not_moving):
         try:
             fn()
         except AssertionError as e:

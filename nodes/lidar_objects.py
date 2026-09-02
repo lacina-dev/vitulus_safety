@@ -25,6 +25,7 @@ a nemá žádnou vazbu na runtime agenta.
 
 import json
 import math
+import os
 import threading
 
 import numpy as np
@@ -42,6 +43,7 @@ from visualization_msgs.msg import Marker, MarkerArray
 # --------------------------------------------------------------------------
 
 DEFAULTS = {
+    'still_mps': 0.15,          # pod tim je objekt v klidu (sum zakmitu shluku ~0,1 m/s)
     # pozadí
     'bg_window_s': 60.0,        # délka okna klouzavého mediánu
     'bg_sample_dt': 0.5,        # jak často se scan ukládá do pozadí
@@ -92,11 +94,28 @@ class Track(object):
         self.last_seen = stamp
         self.hits = 1
         self.missed = 0
+        # SLEDOVÁNÍ POHYBU (majitel 2. 9.: „navrhni sledování objektů a jejich
+        # pohybu"): stopa posledních poloh, směr pohybu, radiální rychlost
+        # (záporná = přibližuje se k robotu) a z toho stav.  Vyhlazuje se
+        # EMA stejně jako rychlost — jeden roztřesený scan nesmí otočit směr.
+        self.path = [(round(cx, 2), round(cy, 2), round(stamp, 2))]
+        self.vx = 0.0
+        self.vy = 0.0
+        self.radial = 0.0            # m/s vůči robotu: <0 blíž, >0 dál
+        self.announced = False       # už ohlášen jako „objevil se"?
 
     def update(self, cx, cy, size, stamp, alpha):
         dt = max(1e-3, stamp - self.last_seen)
         d = math.hypot(cx - self.x, cy - self.y)
         self.speed = (1.0 - alpha) * self.speed + alpha * (d / dt)
+        vx, vy = (cx - self.x) / dt, (cy - self.y) / dt
+        self.vx = (1.0 - alpha) * self.vx + alpha * vx
+        self.vy = (1.0 - alpha) * self.vy + alpha * vy
+        r_old, r_new = math.hypot(self.x, self.y), math.hypot(cx, cy)
+        self.radial = (1.0 - alpha) * self.radial + alpha * ((r_new - r_old) / dt)
+        self.path.append((round(cx, 2), round(cy, 2), round(stamp, 2)))
+        if len(self.path) > 20:
+            del self.path[0]
         self.x = cx
         self.y = cy
         self.size = 0.5 * (self.size + size)
@@ -110,6 +129,25 @@ class Track(object):
     def age_s(self):
         return self.last_seen - self.first_seen
 
+    def motion(self, still_mps=0.15):
+        """'still' | 'approaching' | 'leaving' | 'passing' — podle radiální
+        složky rychlosti; pod `still_mps` je objekt v klidu (šum rychlosti
+        ze zákmitů shluku je typicky do 0,1 m/s)."""
+        if self.speed < still_mps:
+            return 'still'
+        if self.radial < -0.5 * self.speed:
+            return 'approaching'
+        if self.radial > 0.5 * self.speed:
+            return 'leaving'
+        return 'passing'
+
+    @property
+    def heading_deg(self):
+        """Směr pohybu v rámu robota (0° = vpřed), None v klidu."""
+        if math.hypot(self.vx, self.vy) < 0.05:
+            return None
+        return round(math.degrees(math.atan2(self.vy, self.vx)), 1)
+
 
 class ObjectDetector(object):
     """Pozadí + popředí + shluky + tracky. Nezná ROS, jen čísla."""
@@ -119,6 +157,7 @@ class ObjectDetector(object):
         if cfg:
             self.cfg.update({k: v for k, v in cfg.items() if k in DEFAULTS})
         self.tracks = []
+        self.events = []             # appeared/left od posledního vyzvednutí
         self._bg_buf = None          # (N, beams) ring buffer
         self._bg_n = 0               # kolik vzorků je platných
         self._bg_i = 0               # kam se zapíše další
@@ -130,6 +169,11 @@ class ObjectDetector(object):
         self.background_ready = False
 
     # -- pozadí -----------------------------------------------------------
+    def take_events(self):
+        """Vyzvednout a vyprázdnit události (appeared/left) od minula."""
+        ev, self.events = self.events, []
+        return ev
+
     def reset(self):
         """Zapomene pozadí i tracky (jízda robota, restart lidaru)."""
         self._bg_buf = None
@@ -139,6 +183,7 @@ class ObjectDetector(object):
         self._last_bg_sample = None
         self.background_ready = False
         self.tracks = []
+        self.events = []
 
     def _ensure_geometry(self, angle_min, angle_inc, n):
         if self._angles is None or self._n_beams != n:
@@ -270,6 +315,16 @@ class ObjectDetector(object):
                 t.update(best['x'], best['y'], best['size'], stamp, cfg['speed_alpha'])
             else:
                 t.missed += 1
+        # UDÁLOSTI: potvrzený objekt, který zmizel, se ohlásí jako „odešel"
+        # (s poslední polohou a délkou sledování) — majitel se ptá „kdo tu
+        # byl", ne jen „kdo tu je".
+        for t in self.tracks:
+            if t.missed > cfg['max_missed'] and t.announced:
+                self.events.append({'type': 'left', 'id': t.id,
+                                    'cls': self.classify(t),
+                                    'x': round(t.x, 2), 'y': round(t.y, 2),
+                                    'seen_s': round(t.age_s, 1),
+                                    'stamp': round(stamp, 2)})
         self.tracks = [t for t in self.tracks if t.missed <= cfg['max_missed']]
         for c in free:
             self.tracks.append(Track(c['x'], c['y'], c['size'], stamp))
@@ -297,6 +352,12 @@ class ObjectDetector(object):
         for t in self.tracks:
             if t.hits < cfg['confirm_frames'] or t.missed > 0:
                 continue
+            if not t.announced:
+                t.announced = True
+                self.events.append({'type': 'appeared', 'id': t.id,
+                                    'cls': self.classify(t),
+                                    'x': round(t.x, 2), 'y': round(t.y, 2),
+                                    'stamp': round(t.last_seen, 2)})
             out.append({
                 'id': t.id,
                 'cls': self.classify(t),
@@ -307,6 +368,11 @@ class ObjectDetector(object):
                 'age_s': round(t.age_s, 1),
                 'bearing_deg': round(math.degrees(math.atan2(t.y, t.x)), 1),
                 'range_m': round(math.hypot(t.x, t.y), 2),
+                # pohyb
+                'motion': t.motion(cfg.get('still_mps', 0.15)),
+                'heading_deg': t.heading_deg,
+                'radial_mps': round(t.radial, 2),
+                'path': t.path[-10:],
             })
         out.sort(key=lambda o: o['range_m'])
         return out
@@ -331,6 +397,7 @@ class LidarObjectsNode(object):
         self.det = ObjectDetector(cfg)
         self.lock = threading.Lock()
         self.objects = []
+        self.events = []             # appeared/left, vyzvedne cb_publish
         self.moving = False
         self.last_scan_stamp = None
         self.scan_frame = None
@@ -346,6 +413,7 @@ class LidarObjectsNode(object):
         rospy.Subscriber(self.scan_topic, LaserScan, self.cb_scan, queue_size=1)
         rospy.Subscriber(self.odom_topic, Odometry, self.cb_odom, queue_size=1)
         rospy.Timer(rospy.Duration(1.0 / max(0.5, self.publish_rate)), self.cb_publish)
+        rospy.Timer(rospy.Duration(10.0), self.cb_master)
         rospy.loginfo('lidar_objects: scan=%s odom=%s bg_window=%.0fs confirm=%d',
                       self.scan_topic, self.odom_topic,
                       cfg['bg_window_s'], cfg['confirm_frames'])
@@ -376,6 +444,9 @@ class LidarObjectsNode(object):
                                     msg.angle_increment, stamp,
                                     range_max=msg.range_max)
             self.objects = [self._to_base_link(o) for o in objs]
+            self.events.extend(self.det.take_events())
+            if len(self.events) > 50:
+                del self.events[:-50]
             self.last_scan_stamp = stamp
 
     def _lookup_tf(self):
@@ -408,9 +479,24 @@ class LidarObjectsNode(object):
         return o
 
     # -- výstup -----------------------------------------------------------
+    def cb_master(self, _evt):
+        """Hlídání masteru.  rospy se po restartu ROS masteru znovu
+        NEZAREGISTRUJE: uzel běžel 12,5 h, `Publishers: None` (2. 9. 14:00,
+        stack se mezitím restartoval).  Tři neúspěšné dotazy → konec s kódem
+        3, systemd (Restart=always) uzel zvedne a ten se přihlásí znovu."""
+        try:
+            rospy.get_master().getSystemState()
+            self._master_fail = 0
+        except Exception:                                   # noqa: BLE001
+            self._master_fail = getattr(self, '_master_fail', 0) + 1
+            if self._master_fail >= 3:
+                rospy.logerr('lidar_objects: master nedostupný 3×, končím (systemd restartuje)')
+                os._exit(3)
+
     def cb_publish(self, _evt):
         with self.lock:
             objs = list(self.objects)
+            events, self.events = self.events, []
             moving = self.moving
             ready = self.det.background_ready
             frame = self.target_frame if self._tf_ok else (self.scan_frame or '')
@@ -419,6 +505,7 @@ class LidarObjectsNode(object):
             'stamp': round(now.to_sec(), 3),
             'count': len(objs),
             'objects': objs,
+            'events': events,        # appeared / left od minulé zprávy
             'frame_id': frame,
             'moving': bool(moving),
             'background_ready': bool(ready),
