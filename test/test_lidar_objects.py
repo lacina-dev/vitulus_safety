@@ -226,6 +226,33 @@ def test_h_far_flicker_gives_no_event():
     print('H) mihotání 0,5 s v 7 m → 0 událostí; člověk ve 2 m po 1,5 s → appeared  OK')
 
 
+def test_i_two_legs_are_one_person_and_track_survives_gaps():
+    """Dvě nohy (2 shluky 0,2 m, 0,3 m od sebe) = jeden objekt; stopa přežije
+    krátký výpadek (max_missed ~1 s) — 2. 9. 22:03 se člověk rozpadl na dva
+    tracky a „odcházel" každou sekundu."""
+    rng = random.Random(7)
+    frames = warmup(rng, 30.0, 0.01)
+    walk = []
+    for k in range(40):
+        def f(t, k=k, rng=rng):
+            x = 3.0 - 0.04 * k
+            r = put_object(garage(0.01, rng), x, 0.15, 0.20)
+            r = put_object(r, x, -0.15, 0.20)
+            if 18 <= k <= 22:            # 0,5 s výpadek (zákryt)
+                return garage(0.01, rng)
+            return r
+        walk.append(f)
+    det = ObjectDetector({'bg_min_samples': 8}); ev = []; res = []
+    for i, f in enumerate(frames + walk):
+        res.append(det.process(f(i * DT), ANGLE_MIN, ANGLE_INC, i * DT)); ev.extend(det.take_events())
+    tail = res[len(frames) + 6:]
+    assert max(len(r) for r in tail) == 1, 'nohy nesmí být dva objekty (max %d)' % max(len(r) for r in tail)
+    ids = {o['id'] for r in tail for o in r}
+    assert len(ids) == 1, 'stopa má přežít výpadek 0,5 s, ale ID: %s' % ids
+    assert [e['type'] for e in ev] == ['appeared'], 'jen jedno objevení: %s' % [e['type'] for e in ev]
+    print('I) dvě nohy = 1 objekt (%s), jedno ID přes 0,5s výpadek, 1× appeared  OK' % tail[-1][0]['cls'])
+
+
 if __name__ == '__main__':
     fails = 0
     for fn in (test_a_empty_garage_noise, test_b_moving_object,
@@ -233,7 +260,8 @@ if __name__ == '__main__':
                test_d_single_beam_flicker, test_e_motion_tracking_and_events,
                test_f_still_object_is_still_not_moving,
                test_g_sectors_and_noise_adaptive_threshold,
-               test_h_far_flicker_gives_no_event):
+               test_h_far_flicker_gives_no_event,
+               test_i_two_legs_are_one_person_and_track_survives_gaps):
         try:
             fn()
         except AssertionError as e:

@@ -93,7 +93,7 @@ DEFAULTS = {
     # sledování
     'assoc_dist_m': 0.60,       # okno pro přiřazení shluku k trace
     'confirm_frames': 3,        # trvání: kolikrát po sobě musí být viděn
-    'max_missed': 3,            # kolik scanů smí chybět, než trace zanikne
+    'max_missed': 10,           # kolik scanů smí chybět, než trace zanikne (~1 s; 3 lámalo stopu člověka v pohybu)
     'speed_alpha': 0.4,         # vyhlazení rychlosti (EMA)
     'max_speed_mps': 4.0,       # rychlejší "objekt" je skok asociace, ne zvíře
     # klasifikace
@@ -369,7 +369,30 @@ class ObjectDetector(object):
             if n < self._min_points(rng, angle_inc):
                 continue
             out.append({'x': cx, 'y': cy, 'size': size, 'range': rng, 'n': n})
-        return out
+        return self._merge_close(out)
+
+    def _merge_close(self, clusters, gap_m=0.55):
+        """Shluky blíž než `gap_m` k sobě = jeden objekt.  Člověk = dvě nohy
+        = dva shluky 0,2 m široké 0,3 m od sebe → dva tracky „medium", které
+        se střídavě ztrácely (2. 9. 22:03: appeared 3,23 m + 3,63 m v téže
+        sekundě).  Sloučený rozměr = rozpětí, max. `max_size_m` hlídá dál."""
+        if len(clusters) < 2:
+            return clusters
+        clusters = sorted(clusters, key=lambda c: math.atan2(c['y'], c['x']))
+        merged = [dict(clusters[0])]
+        for c in clusters[1:]:
+            m = merged[-1]
+            if math.hypot(c['x'] - m['x'], c['y'] - m['y']) < gap_m + 0.5 * (c['size'] + m['size']):
+                n = m['n'] + c['n']
+                span = math.hypot(c['x'] - m['x'], c['y'] - m['y']) + 0.5 * (c['size'] + m['size'])
+                m['x'] = (m['x'] * m['n'] + c['x'] * c['n']) / n
+                m['y'] = (m['y'] * m['n'] + c['y'] * c['n']) / n
+                m['size'] = min(max(m['size'], c['size'], span), self.cfg['max_size_m'])
+                m['n'] = n
+                m['range'] = math.hypot(m['x'], m['y'])
+            else:
+                merged.append(dict(c))
+        return merged
 
     def _min_points(self, rng, angle_inc):
         cfg = self.cfg
@@ -598,8 +621,11 @@ class LidarObjectsNode(object):
             png = os.path.join(self.snapshot_dir, base + '.png')
             if self._render_scan(png, objs, event):
                 paths['scan_png'] = png
-            if (event.get('type') == 'appeared'
-                    and event.get('sector') == 'front'):
+            # Kamera při KAŽDÉM objevení: D435 vidí jen dopředu (~69°), ale
+            # v doku je otevřeno vpředu-vlevo a člověk se tudy pohybuje —
+            # jeden JPEG je levný a majitel ho chce vidět (2. 9. 22:03: šel
+            # vlevo, kamera se nevzala, v chatu nic).
+            if event.get('type') == 'appeared':
                 jpg = os.path.join(self.snapshot_dir, base + '.jpg')
                 if self._grab_camera(jpg):
                     paths['camera_jpg'] = jpg
