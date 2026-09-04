@@ -55,7 +55,7 @@ DEFAULTS = {
     'still_s': 10.0,
     # ÚSPORA: v klidu se zpracuje každý `idle_every`-tý scan; po detekci
     # (nebo události) plné tempo na `boost_s` sekund.
-    'idle_every': 3,
+    'idle_every': 10,           # v klidu 1 scan/s (majitel 4. 9.); kandidát/událost → plné tempo
     'bg_recompute_s': 5.0,      # přepočet mediánu/MAD pozadí nejvýš takhle často
     'boost_s': 30.0,
     # SNÍMKY při události: adresář, kamera pro objekt vpředu.
