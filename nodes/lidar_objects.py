@@ -62,7 +62,16 @@ DEFAULTS = {
     'snapshot_dir': '~/.vitulus/lidar_events',
     'camera_topic': '/d435/color/image_raw/compressed',
     'camera_front_deg': 60.0,   # |bearing| pod tím = „vpředu", má smysl kamera
-    'still_mps': 0.15,          # pod tim je objekt v klidu (sum zakmitu shluku ~0,1 m/s)
+    'still_mps': 0.15,
+    # MIHOTÁNÍ DÁLKY (2. 9. 21:07–21:12 živě): 13 párů „objevil se → odešel"
+    # do 1–2 s ve 4–8 m vlevo — dva tři paprsky na hranici dosahu, ne
+    # člověk.  Událost se ohlásí až po `appear_min_s` sledování a jen do
+    # `event_max_range_m`; potvrzení tracku ve větší dálce vyžaduje víc
+    # scanů (`far_confirm_frames` od `far_range_m`).
+    'appear_min_s': 1.0,
+    'event_max_range_m': 5.0,
+    'far_range_m': 3.5,
+    'far_confirm_frames': 8,          # pod tim je objekt v klidu (sum zakmitu shluku ~0,1 m/s)
     # pozadí
     'bg_window_s': 60.0,        # délka okna klouzavého mediánu
     'bg_sample_dt': 0.5,        # jak často se scan ukládá do pozadí
@@ -426,9 +435,12 @@ class ObjectDetector(object):
         cfg = self.cfg
         out = []
         for t in self.tracks:
-            if t.hits < cfg['confirm_frames'] or t.missed > 0:
+            rng = math.hypot(t.x, t.y)
+            need = cfg['confirm_frames'] if rng < cfg['far_range_m'] else cfg['far_confirm_frames']
+            if t.hits < need or t.missed > 0:
                 continue
-            if not t.announced:
+            if (not t.announced and t.age_s >= cfg['appear_min_s']
+                    and rng <= cfg['event_max_range_m']):
                 t.announced = True
                 self.events.append({'type': 'appeared', 'id': t.id,
                                     'cls': self.classify(t),
@@ -603,7 +615,12 @@ class LidarObjectsNode(object):
         except Exception as exc:                                # noqa: BLE001
             rospy.logwarn('lidar_objects: snímek události selhal: %s', exc)
 
-    def _render_scan(self, path, objs, event, size=480, span_m=6.0):
+    def _render_scan(self, path, objs, event, size=480, span_m=None):
+        if span_m is None:
+            # rozsah tak, aby objekt události byl VIDĚT (7,4 m mimo 6m plátno)
+            rmax = max([float(event.get('range_m') or 0)] +
+                       [float(o.get('range_m') or 0) for o in objs])
+            span_m = max(6.0, min(12.0, rmax + 1.5))
         """PNG: scan shora (předek nahoru), sektory, objekty s třídou/pohybem."""
         try:
             from PIL import Image, ImageDraw
@@ -621,10 +638,11 @@ class LidarObjectsNode(object):
         k = c / span_m
         def px(x, y):                       # base_link: x vpřed (nahoru), y vlevo (doleva)
             return (c - y * k, c - x * k)
-        for m in (1, 2, 3, 4, 5):
+        for m in range(1, int(span_m) + 1):
             d.ellipse([c - m * k, c - m * k, c + m * k, c + m * k], outline=(40, 52, 62))
+            d.text((c + m * k + 2, c - 6), '%dm' % m, fill=(70, 85, 100))
         for ang, lab in ((0, 'FRONT'), (90, 'LEFT'), (180, 'BACK'), (-90, 'RIGHT')):
-            ex, ey = px(5.5 * math.cos(math.radians(ang)), 5.5 * math.sin(math.radians(ang)))
+            ex, ey = px((span_m - 0.5) * math.cos(math.radians(ang)), (span_m - 0.5) * math.sin(math.radians(ang)))
             d.text((ex - 16, ey - 6), lab, fill=(120, 140, 160))
         for i, rr in enumerate(r):
             if not np.isfinite(rr) or rr <= 0.05 or rr > span_m:

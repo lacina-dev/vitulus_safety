@@ -207,13 +207,33 @@ def test_g_sectors_and_noise_adaptive_threshold():
     print('G) sektory OK; dýchající stěna ±8 cm → 0 objektů, klid MAD %.3f m; člověk vpředu → 1 objekt front  OK' % nz['mad_median_m'])
 
 
+def test_h_far_flicker_gives_no_event():
+    """Mihotání dálky: objekt ve 7 m, který se ukáže na 0,5 s, nesmí dát
+    událost; blízký člověk sledovaný > 1 s ano."""
+    rng = random.Random(21)
+    frames = warmup(rng, 30.0, 0.01)
+    blik = [(lambda t, rng=rng: put_object(garage(0.01, rng), 7.0, 2.0, 0.4)) for _ in range(5)]
+    det = ObjectDetector({'bg_min_samples': 8})
+    events = []
+    for i, f in enumerate(frames + blik + warmup(rng, 2.0, 0.01)):
+        det.process(f(i * DT), ANGLE_MIN, ANGLE_INC, i * DT); events.extend(det.take_events())
+    assert not events, 'mihotání v 7 m nesmí dát událost: %s' % events
+    det2 = ObjectDetector({'bg_min_samples': 8}); ev2 = []
+    near = [(lambda t, rng=rng: put_object(garage(0.01, rng), 2.0, 0.2, 0.45)) for _ in range(15)]
+    for i, f in enumerate(frames + near):
+        det2.process(f(i * DT), ANGLE_MIN, ANGLE_INC, i * DT); ev2.extend(det2.take_events())
+    assert [e['type'] for e in ev2] == ['appeared'], 'člověk ve 2 m po 1,5 s: %s' % ev2
+    print('H) mihotání 0,5 s v 7 m → 0 událostí; člověk ve 2 m po 1,5 s → appeared  OK')
+
+
 if __name__ == '__main__':
     fails = 0
     for fn in (test_a_empty_garage_noise, test_b_moving_object,
                test_c_static_object_ages_into_background,
                test_d_single_beam_flicker, test_e_motion_tracking_and_events,
                test_f_still_object_is_still_not_moving,
-               test_g_sectors_and_noise_adaptive_threshold):
+               test_g_sectors_and_noise_adaptive_threshold,
+               test_h_far_flicker_gives_no_event):
         try:
             fn()
         except AssertionError as e:
