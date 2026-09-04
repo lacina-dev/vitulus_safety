@@ -253,6 +253,38 @@ def test_i_two_legs_are_one_person_and_track_survives_gaps():
     print('I) dvě nohy = 1 objekt (%s), jedno ID přes 0,5s výpadek, 1× appeared  OK' % tail[-1][0]['cls'])
 
 
+def test_j_depth_height_classifies_person_dog_cat():
+    """Z hloubkového obrazu (640×480, K jako D435) se změří výška objektu
+    pod směrem z lidaru: člověk 1,7 m → large, pes 0,5 m → medium, kočka
+    0,25 m → small; objekt mimo záběr → None."""
+    from lidar_objects import depth_object_extent, class_from_height
+    K = [616.8, 0, 326.2, 0, 616.7, 235.1, 0, 0, 1]
+    fx, cx, fy, cy = K[0], K[2], K[4], K[5]
+
+    def scene(height_m, z=2.0, bearing=10.0):
+        d = np.full((480, 640), 4.0, dtype=np.float32)          # zeď ve 4 m
+        u = int(cx - fx * math.tan(math.radians(bearing)))
+        hw = int(fx * 0.25 / z)                                   # 0,5 m široký
+        rows = int(fy * height_m / z)
+        v1 = int(cy + fy * 0.6 / z)                               # spodek 0,6 m pod osou (v záběru)
+        v0 = max(0, v1 - rows)
+        d[v0:v1, u - hw:u + hw] = z
+        return d
+    out = {}
+    # člověk ve 2 m se do svislého záběru (~42°) nevejde → měří se ve 3 m;
+    # blízký oříznutý objekt hlásí clipped_top a třída se z výšky NEurčuje.
+    ext = depth_object_extent(scene(1.7, z=2.0), K, 10.0, 2.0 / math.cos(math.radians(10.0)))
+    assert ext and ext['clipped_top'], 'blízký člověk je oříznutý: %s' % ext
+    for name, h, z in (('člověk', 1.7, 3.0), ('pes', 0.5, 2.0), ('kočka', 0.25, 2.0)):
+        ext = depth_object_extent(scene(h, z=z), K, 10.0, z / math.cos(math.radians(10.0)))
+        assert ext and abs(ext['height_m'] - h) < 0.08, '%s: %s' % (name, ext)
+        out[name] = (ext['height_m'], class_from_height(ext['height_m']))
+    assert out['člověk'][1] == 'large' and out['pes'][1] == 'medium' and out['kočka'][1] == 'small'
+    assert depth_object_extent(scene(1.7), K, 80.0, 2.0) is None, 'mimo záběr'
+    print('J) hloubka: člověk %.2f m→%s, pes %.2f m→%s, kočka %.2f m→%s; mimo záběr → None  OK'
+          % (out['člověk'][0], out['člověk'][1], out['pes'][0], out['pes'][1], out['kočka'][0], out['kočka'][1]))
+
+
 if __name__ == '__main__':
     fails = 0
     for fn in (test_a_empty_garage_noise, test_b_moving_object,
@@ -261,7 +293,8 @@ if __name__ == '__main__':
                test_f_still_object_is_still_not_moving,
                test_g_sectors_and_noise_adaptive_threshold,
                test_h_far_flicker_gives_no_event,
-               test_i_two_legs_are_one_person_and_track_survives_gaps):
+               test_i_two_legs_are_one_person_and_track_survives_gaps,
+               test_j_depth_height_classifies_person_dog_cat):
         try:
             fn()
         except AssertionError as e:

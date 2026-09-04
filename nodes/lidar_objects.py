@@ -61,7 +61,7 @@ DEFAULTS = {
     # SNÍMKY při události: adresář, kamera pro objekt vpředu.
     'snapshot_dir': '~/.vitulus/lidar_events',
     'camera_topic': '/d435/color/image_raw/compressed',
-    'camera_front_deg': 60.0,   # |bearing| pod tím = „vpředu", má smysl kamera
+    'camera_fov_deg': 70.0,     # zaber D435 vodorovne; foto jen kdyz je objekt v nem
     'still_mps': 0.15,
     # MIHOTÁNÍ DÁLKY (2. 9. 21:07–21:12 živě): 13 párů „objevil se → odešel"
     # do 1–2 s ve 4–8 m vlevo — dva tři paprsky na hranici dosahu, ne
@@ -439,6 +439,10 @@ class ObjectDetector(object):
 
     def classify(self, t):
         cfg = self.cfg
+        h = getattr(t, 'height_m', None)
+        if h is not None:
+            # výška z hloubky (noc i den) je spolehlivější než rozměr z lidaru
+            return class_from_height(h)
         w = t.size
         if t.speed > cfg['max_speed_mps']:
             return 'unknown'
@@ -496,6 +500,146 @@ class ObjectDetector(object):
 # ROS obal
 # --------------------------------------------------------------------------
 
+def render_scan_png(path, ranges, meta, tf, objs, event, size=480, span_m=None,
+                    camera_fov_deg=70.0):
+    """PNG scanu shora: PŘEDEK robota nahoru a výrazně vyznačený (šipka +
+    popisek), výseč záběru kamery, kroužky po metru, objekty s třídou
+    a pohybem, objekt události červeně.  Čistá funkce — bez ROS, testovatelná.
+
+    Majitel (4. 9.): „na scanu vyznač, kde je robotovo vpředu."
+    """
+    try:
+        from PIL import Image, ImageDraw
+    except ImportError:
+        return False
+    a0, inc, _st = meta
+    objs = list(objs or [])
+    if span_m is None:
+        rmax = max([float(event.get('range_m') or 0)] +
+                   [float(o.get('range_m') or 0) for o in objs])
+        span_m = max(6.0, min(12.0, rmax + 1.5))
+    img = Image.new('RGB', (size, size), (18, 24, 30))
+    d = ImageDraw.Draw(img)
+    c = size / 2.0
+    k = c / span_m
+
+    def px(x, y):                       # base_link: x vpřed (nahoru), y vlevo (doleva)
+        return (c - y * k, c - x * k)
+
+    # výseč záběru kamery (jen dopředu)
+    half = math.radians(camera_fov_deg / 2.0)
+    wedge = [px(0, 0)] + [px(span_m * math.cos(a), span_m * math.sin(a))
+                          for a in np.linspace(-half, half, 12)]
+    d.polygon(wedge, fill=(26, 40, 48))
+    for m in range(1, int(span_m) + 1):
+        d.ellipse([c - m * k, c - m * k, c + m * k, c + m * k], outline=(40, 52, 62))
+        d.text((c + m * k + 2, c - 6), '%dm' % m, fill=(70, 85, 100))
+    # PIL font bez diakritiky -> ASCII popisky; kraje odsazene, at se neoriznou
+    for ang, lab, dx in ((90, 'LEFT / vlevo', 4), (180, 'BACK / vzadu', -36), (-90, 'RIGHT / vpravo', -84)):
+        ex, ey = px((span_m - 0.3) * math.cos(math.radians(ang)),
+                    (span_m - 0.3) * math.sin(math.radians(ang)))
+        d.text((ex + dx, ey - 6), lab, fill=(120, 140, 160))
+    tx, ty, tyaw = tf
+    for i, rr in enumerate(ranges):
+        if not np.isfinite(rr) or rr <= 0.05 or rr > span_m:
+            continue
+        ang = a0 + i * inc
+        x, y = rr * math.cos(ang), rr * math.sin(ang)
+        xb = tx + x * math.cos(tyaw) - y * math.sin(tyaw)
+        yb = ty + x * math.sin(tyaw) + y * math.cos(tyaw)
+        d.point(px(xb, yb), fill=(220, 200, 80))
+    for o in objs:
+        X, Y = px(o['x'], o['y'])
+        rad = max(6, o.get('size', 0.3) * k / 2)
+        col = (255, 80, 80) if o.get('id') == event.get('id') else (255, 160, 60)
+        d.ellipse([X - rad, Y - rad, X + rad, Y + rad], outline=col, width=3)
+        d.text((X + rad + 3, Y - 7), '%s %s %.1f m' % (
+            o.get('cls'), o.get('motion', ''), float(o.get('range_m') or 0)), fill=col)
+        for (pxx, pyy, _t) in (o.get('path') or [])[-10:]:
+            d.point(px(pxx, pyy), fill=col)
+    # PŘEDEK: šipka z robota dopředu + popisek nahoře
+    d.line([px(0, 0), px(1.2, 0)], fill=(80, 220, 120), width=3)
+    d.polygon([px(1.2, 0), px(0.95, 0.12), px(0.95, -0.12)], fill=(80, 220, 120))
+    d.polygon([px(0.25, 0), px(-0.15, 0.15), px(-0.15, -0.15)], fill=(80, 200, 120))
+    d.text((c - 62, 6), 'FRONT = predek robota  ^', fill=(120, 240, 150))
+    d.text((6, size - 30), 'kamera vidi jen tmavsi vysec vpredu', fill=(90, 120, 140))
+    d.text((6, size - 16), '%s #%s %s' % (
+        event.get('type'), event.get('id'),
+        time.strftime('%d.%m. %H:%M:%S', time.localtime(float(event.get('stamp') or 0)))),
+        fill=(200, 200, 200))
+    img.save(path)
+    return True
+
+
+def depth_object_extent(depth_m, K, bearing_deg, range_m, tol_m=None):
+    """Výška a šířka objektu z hloubkového obrazu (zarovnaného s barvou).
+
+    Majitel (4. 9.): „depth image by mohl fungovat i v noci a pomohl by
+    rozpoznat psa, člověka nebo kočku."  Lidar dá směr a vzdálenost; ve
+    sloupci obrazu pod tím směrem se vezmou pixely s hloubkou ≈ vzdálenost
+    a jejich svislý rozsah × Z / fy = výška v metrech.  Člověk 1,6–1,9 m,
+    pes 0,3–0,7 m, kočka pod 0,35 m — o třídu lepší než rozměr z lidaru.
+
+    depth_m: (H, W) float metry (0 = neznámo); K: [fx,0,cx,0,fy,cy,…].
+    -> dict(height_m, width_m, top_m, points, u0, u1, v0, v1) nebo None.
+    Kamera: z dopředu, x doprava, y dolů; lidar bearing +vlevo → u = cx − fx·tan(b).
+    """
+    fx, cx, fy, cy = float(K[0]), float(K[2]), float(K[4]), float(K[5])
+    b = math.radians(float(bearing_deg))
+    H, W = depth_m.shape
+    Z = max(0.2, float(range_m) * math.cos(b))
+    u = cx - fx * math.tan(b)
+    if u < 0 or u >= W:
+        return None                       # mimo záběr
+    half = max(10, int(fx * 0.45 / Z))    # ±0,45 m kolem směru
+    u0, u1 = max(0, int(u - half)), min(W, int(u + half) + 1)
+    win = depth_m[:, u0:u1]
+    tol = tol_m if tol_m is not None else max(0.35, 0.15 * Z)
+    mask = np.isfinite(win) & (win > 0.1) & (np.abs(win - Z) < tol)
+    if int(mask.sum()) < 40:
+        return None
+    rows = np.nonzero(mask.any(axis=1))[0]
+    cols = np.nonzero(mask.any(axis=0))[0]
+    v0, v1 = int(rows.min()), int(rows.max())
+    c0, c1 = int(cols.min()) + u0, int(cols.max()) + u0
+    zs = float(np.median(win[mask]))
+    return {'height_m': round((v1 - v0) * zs / fy, 2),
+            'width_m': round((c1 - c0) * zs / fx, 2),
+            'top_m': round(-(v0 - cy) * zs / fy, 2),      # nad optickou osou +
+            'z_m': round(zs, 2), 'points': int(mask.sum()),
+            'u0': c0, 'u1': c1, 'v0': v0, 'v1': v1,
+            'clipped_top': v0 <= 1, 'clipped_bottom': v1 >= H - 2}
+
+
+def class_from_height(height_m):
+    if height_m is None:
+        return None
+    if height_m < 0.35:
+        return 'small'
+    if height_m < 0.85:
+        return 'medium'
+    return 'large'
+
+
+def render_depth_png(path, depth_m, box, max_m=5.0):
+    """Hloubka jako šedý obraz (blíž = světlejší) s rámečkem objektu."""
+    try:
+        from PIL import Image, ImageDraw
+    except ImportError:
+        return False
+    d = np.where(np.isfinite(depth_m) & (depth_m > 0.05), depth_m, max_m)
+    g = (255 * (1.0 - np.clip(d / max_m, 0, 1))).astype(np.uint8)
+    img = Image.fromarray(g, 'L').convert('RGB')
+    if box:
+        dr = ImageDraw.Draw(img)
+        dr.rectangle([box['u0'], box['v0'], box['u1'], box['v1']], outline=(255, 80, 80), width=3)
+        dr.text((box['u0'], max(0, box['v0'] - 14)),
+                'vyska %.2f m, sirka %.2f m, %.1f m' % (box['height_m'], box['width_m'], box['z_m']),
+                fill=(255, 120, 120))
+    img.save(path)
+    return True
+
+
 class LidarObjectsNode(object):
 
     def __init__(self):
@@ -521,6 +665,8 @@ class LidarObjectsNode(object):
         self._last_scan_meta = None
         self.snapshot_dir = os.path.expanduser(rospy.get_param('~snapshot_dir', cfg['snapshot_dir']))
         self.camera_topic = rospy.get_param('~camera_topic', cfg['camera_topic'])
+        self.depth_topic = rospy.get_param('~depth_topic', '/d435/aligned_depth_to_color/image_raw')
+        self.depth_info_topic = rospy.get_param('~depth_info_topic', '/d435/color/camera_info')
         self.last_scan_stamp = None
         self.scan_frame = None
         self._tf = (0.0, 0.0, 0.0)     # base_link ← scan_frame (x, y, yaw)
@@ -621,14 +767,32 @@ class LidarObjectsNode(object):
             png = os.path.join(self.snapshot_dir, base + '.png')
             if self._render_scan(png, objs, event):
                 paths['scan_png'] = png
-            # Kamera při KAŽDÉM objevení: D435 vidí jen dopředu (~69°), ale
-            # v doku je otevřeno vpředu-vlevo a člověk se tudy pohybuje —
-            # jeden JPEG je levný a majitel ho chce vidět (2. 9. 22:03: šel
-            # vlevo, kamera se nevzala, v chatu nic).
-            if event.get('type') == 'appeared':
+            # FOTO JEN KDYŽ JE OBJEKT V ZÁBĚRU (majitel 4. 9.): D435 vidí
+            # ±camera_fov_deg/2 dopředu; mimo výseč by fotka ukázala prázdno.
+            b = None
+            if event.get('x') is not None and event.get('y') is not None:
+                b = math.degrees(math.atan2(float(event['y']), float(event['x'])))
+            in_frame = b is not None and abs(b) <= float(self.det.cfg['camera_fov_deg']) / 2.0
+            event['in_camera'] = bool(in_frame)
+            if event.get('type') == 'appeared' and in_frame:
                 jpg = os.path.join(self.snapshot_dir, base + '.jpg')
                 if self._grab_camera(jpg):
                     paths['camera_jpg'] = jpg
+                # HLOUBKA: funguje i v noci a dá VÝŠKU → třída (majitel 4. 9.)
+                dpng = os.path.join(self.snapshot_dir, base + '_depth.png')
+                ext = self._grab_depth(dpng, b, float(event.get('range_m') or 0))
+                if ext:
+                    paths['depth_png'] = dpng
+                    event['height_m'] = ext['height_m']
+                    event['width_m'] = ext['width_m']
+                    cls_d = class_from_height(ext['height_m'])
+                    if cls_d and not ext.get('clipped_top'):
+                        event['cls_lidar'] = event.get('cls')
+                        event['cls'] = cls_d
+                        with self.lock:
+                            for t in self.det.tracks:
+                                if t.id == event.get('id'):
+                                    t.height_m = ext['height_m']
             rec = dict(event)
             rec.update({'snapshot': paths, 'objects': objs,
                         'noise': self.det.noise(), 'docked': self.docked})
@@ -642,56 +806,35 @@ class LidarObjectsNode(object):
             rospy.logwarn('lidar_objects: snímek události selhal: %s', exc)
 
     def _render_scan(self, path, objs, event, size=480, span_m=None):
-        if span_m is None:
-            # rozsah tak, aby objekt události byl VIDĚT (7,4 m mimo 6m plátno)
-            rmax = max([float(event.get('range_m') or 0)] +
-                       [float(o.get('range_m') or 0) for o in objs])
-            span_m = max(6.0, min(12.0, rmax + 1.5))
-        """PNG: scan shora (předek nahoru), sektory, objekty s třídou/pohybem."""
-        try:
-            from PIL import Image, ImageDraw
-        except ImportError:
-            return False
         with self.lock:
             r = self._last_ranges
             meta = self._last_scan_meta
         if r is None or meta is None:
             return False
-        a0, inc, _st = meta
-        img = Image.new('RGB', (size, size), (18, 24, 30))
-        d = ImageDraw.Draw(img)
-        c = size / 2.0
-        k = c / span_m
-        def px(x, y):                       # base_link: x vpřed (nahoru), y vlevo (doleva)
-            return (c - y * k, c - x * k)
-        for m in range(1, int(span_m) + 1):
-            d.ellipse([c - m * k, c - m * k, c + m * k, c + m * k], outline=(40, 52, 62))
-            d.text((c + m * k + 2, c - 6), '%dm' % m, fill=(70, 85, 100))
-        for ang, lab in ((0, 'FRONT'), (90, 'LEFT'), (180, 'BACK'), (-90, 'RIGHT')):
-            ex, ey = px((span_m - 0.5) * math.cos(math.radians(ang)), (span_m - 0.5) * math.sin(math.radians(ang)))
-            d.text((ex - 16, ey - 6), lab, fill=(120, 140, 160))
-        for i, rr in enumerate(r):
-            if not np.isfinite(rr) or rr <= 0.05 or rr > span_m:
-                continue
-            ang = a0 + i * inc
-            x, y = rr * math.cos(ang), rr * math.sin(ang)
-            tx, ty, tyaw = self._tf
-            xb = tx + x * math.cos(tyaw) - y * math.sin(tyaw)
-            yb = ty + x * math.sin(tyaw) + y * math.cos(tyaw)
-            X, Y = px(xb, yb)
-            d.point((X, Y), fill=(220, 200, 80))
-        for o in objs:
-            X, Y = px(o['x'], o['y'])
-            rad = max(4, o.get('size', 0.3) * k / 2)
-            col = (255, 80, 80) if o.get('id') == event.get('id') else (255, 160, 60)
-            d.ellipse([X - rad, Y - rad, X + rad, Y + rad], outline=col, width=2)
-            d.text((X + rad + 2, Y - 6), '%s %s %.1fm' % (o.get('cls'), o.get('motion', ''), o.get('range_m', 0)), fill=col)
-        d.polygon([px(0.25, 0), px(-0.15, 0.15), px(-0.15, -0.15)], fill=(80, 200, 120))
-        d.text((6, 6), '%s #%s %s' % (event.get('type'), event.get('id'),
-                                       time.strftime('%d.%m. %H:%M:%S', time.localtime(float(event.get('stamp') or 0)))),
-               fill=(200, 200, 200))
-        img.save(path)
-        return True
+        return render_scan_png(path, r, meta, self._tf, objs, event, size=size,
+                               span_m=span_m, camera_fov_deg=float(self.det.cfg['camera_fov_deg']))
+
+    def _grab_depth(self, path, bearing_deg, range_m, timeout_s=2.5):
+        """Jeden hloubkový snímek (zarovnaný s barvou) → výška/šířka objektu
+        pod směrem z lidaru + PNG vizualizace.  -> dict nebo None."""
+        try:
+            from sensor_msgs.msg import Image, CameraInfo
+            info = getattr(self, '_cam_info', None)
+            if info is None:
+                info = rospy.wait_for_message(self.depth_info_topic, CameraInfo, timeout=timeout_s)
+                self._cam_info = info
+            msg = rospy.wait_for_message(self.depth_topic, Image, timeout=timeout_s)
+            if msg.encoding != '16UC1':
+                rospy.logwarn('lidar_objects: hloubka v %s, čekám 16UC1', msg.encoding)
+                return None
+            depth = (np.frombuffer(msg.data, dtype=np.uint16)
+                     .reshape(msg.height, msg.width).astype(np.float32) / 1000.0)
+            ext = depth_object_extent(depth, list(info.K), bearing_deg, range_m)
+            render_depth_png(path, depth, ext)
+            return ext
+        except Exception as exc:                                # noqa: BLE001
+            rospy.logwarn('lidar_objects: hloubka nedala snímek: %s', exc)
+            return None
 
     def _grab_camera(self, path, timeout_s=2.0):
         """Jeden snímek z kamery (CompressedImage → JPEG na disk)."""
