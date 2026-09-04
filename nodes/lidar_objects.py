@@ -737,7 +737,11 @@ class LidarObjectsNode(object):
                                     msg.angle_increment, stamp,
                                     range_max=msg.range_max)
             self.objects = [self._to_base_link(o) for o in objs]
-            nove = self.det.take_events()
+            # UDÁLOSTI DO base_link.  Objekty se převáděly, události ne —
+            # a base_scan je vůči base_link otočený o −90°, takže člověk
+            # VPŘEDU byl v události „vlevo", kamera ani hloubka se nevzaly
+            # a chat lhal o straně (4. 9. 22:21, scan to ukazoval vpředu).
+            nove = [self._event_to_base_link(e) for e in self.det.take_events()]
             if nove or objs:
                 self._boost_until = now + float(self.det.cfg['boost_s'])
             self._last_ranges = np.array(msg.ranges, dtype=np.float64)
@@ -864,6 +868,22 @@ class LidarObjectsNode(object):
             self._tf_ok = True
         except Exception:
             pass    # zkusí se znovu při dalším scanu, mezitím jedeme v rámu lidaru
+
+    def _event_to_base_link(self, e):
+        e = dict(e)
+        if e.get('x') is None or e.get('y') is None:
+            return e
+        o = self._to_base_link({'x': float(e['x']), 'y': float(e['y'])})
+        e['x'], e['y'] = o['x'], o['y']
+        e['bearing_deg'] = o['bearing_deg']
+        e['range_m'] = o['range_m']
+        e['sector'] = sector_of(o['bearing_deg'])
+        if e.get('path'):
+            tx, ty, yaw = self._tf
+            c, s_ = math.cos(yaw), math.sin(yaw)
+            e['path'] = [(round(c * px - s_ * py + tx, 2), round(s_ * px + c * py + ty, 2), t)
+                         for (px, py, t) in e['path']]
+        return e
 
     def _to_base_link(self, o):
         tx, ty, yaw = self._tf
