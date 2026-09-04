@@ -790,7 +790,13 @@ class LidarObjectsNode(object):
                     event['height_m'] = ext['height_m']
                     event['width_m'] = ext['width_m']
                     cls_d = class_from_height(ext['height_m'])
-                    if cls_d and not ext.get('clipped_top'):
+                    # Oříznutá hlava (blízký člověk mimo svislý záběr) = výška
+                    # je jen SPODNÍ odhad: ≥ 0,85 m i oříznuté je člověk;
+                    # menší oříznuté se neurčuje (4. 9. 22:41: 1,05 m → „malé
+                    # zvíře", protože se třída u oříznutého vůbec neměnila).
+                    if ext.get('clipped_top') and cls_d != 'large':
+                        cls_d = None
+                    if cls_d:
                         event['cls_lidar'] = event.get('cls')
                         event['cls'] = cls_d
                         with self.lock:
