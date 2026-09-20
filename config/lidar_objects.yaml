@@ -25,16 +25,29 @@ cluster_gap_k: 3.0            # práh mezery roste s dosahem (r × Δθ)
 # Filtr kandidátů
 min_size_m: 0.15              # kočka
 max_size_m: 1.20              # člověk / velký pes; větší = zeď, auto
-min_points_floor: 2
+min_points_floor: 3           # 2 paprsky = hrana, ne zvíře
 min_points_near: 4
 near_range_m: 3.0
 
 # Sledování mezi scany
 assoc_dist_m: 0.60
-confirm_frames: 3             # trvání ~0,3 s při 10 Hz lidaru
-max_missed: 3
+confirm_frames: 3             # souvislá série zásahů (~0,3 s při 10 Hz); výpadek ji nuluje
+far_range_m: 3.5
+far_confirm_frames: 6         # dál než far_range_m je potřeba delší série
+appear_min_s: 1.0             # ohlásí se (a publikuje) až po tolika sekundách sledování
+event_max_range_m: 8.0
+max_missed: 10                # ~1 s výpadku stopa přežije
 speed_alpha: 0.4
 max_speed_mps: 4.0
+
+# Mihotání ≠ objekt (5. 9.) — čtyři nezávislé důkazy, viz komentář v uzlu
+flicker_flips: 3              # paprsek, který v okně pozadí ≥ tolikrát přeskočil blíž a zpět
+flicker_alt_tol_m: 0.25       # návrat v této toleranci od bližšího módu = známý povrch
+flicker_neigh_beams: 4        # kolik sousedů se hledá pro „bližší mód sedí na hraně"
+solid_ratio_min: 0.5          # podíl nemihotavých paprsků nutný pro novou stopu
+edge_tol_m: 0.30              # malý shluk v dosahu pozadí sousedů = odštěpek stěny
+edge_max_points: 6
+straightness_min: 0.35        # pohybující se stopa musí jít někam
 
 # Hrubá klasifikace podle šířky (a rychlosti)
 cls_small_max_m: 0.30         # < small (kočka)

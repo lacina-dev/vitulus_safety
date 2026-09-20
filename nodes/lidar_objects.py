@@ -28,6 +28,7 @@ import math
 import os
 import threading
 import time
+import warnings
 
 import numpy as np
 import rospy
@@ -69,9 +70,33 @@ DEFAULTS = {
     # `event_max_range_m`; potvrzení tracku ve větší dálce vyžaduje víc
     # scanů (`far_confirm_frames` od `far_range_m`).
     'appear_min_s': 1.0,
-    'event_max_range_m': 5.0,
+    'event_max_range_m': 8.0,
     'far_range_m': 3.5,
-    'far_confirm_frames': 8,          # pod tim je objekt v klidu (sum zakmitu shluku ~0,1 m/s)
+    'far_confirm_frames': 6,          # pod tim je objekt v klidu (sum zakmitu shluku ~0,1 m/s)
+    # MIHOTÁNÍ ≠ OBJEKT (5. 9., majitel: „odliš mihotání od skutečného
+    # objektu").  Z historie událostí 2.–5. 9.: 36 z 50 „odchodů" pod 2 s,
+    # dvě místa se vracela pořád dokola — (−1,3; 3,75) 5× a (1,7; 4,75) 5×.
+    # To nejsou zvířata, to jsou hrany/šikmé plochy, kde paprsek přeskakuje
+    # mezi bližší a vzdálenější plochou.  Čtyři nezávislé důkazy:
+    #  1) MIHOTAVÝ PAPRSEK: v okně pozadí přeskočil blíž a zpět aspoň
+    #     `flicker_flips`×, a jeho bližší mód sedí na pozadí sousedních
+    #     paprsků (hrana) nebo na vlastní medián (šikmá plocha).  Návrat v
+    #     `flicker_alt_tol_m` od bližšího módu je známý povrch, ne objekt.
+    #  2) NOVÁ STOPA potřebuje aspoň `solid_ratio_min` nemihotavých paprsků.
+    #  3) ODŠTĚPEK STĚNY: malý shluk (≤ `edge_max_points`) v dosahu
+    #     `edge_tol_m` od pozadí sousedních paprsků nezakládá stopu.
+    #  4) ROZTŘESENÁ STOPA: co se „hýbe", ale nejde nikam (přímost dráhy
+    #     < `straightness_min`), není zvíře — zvíře i člověk jdou někam.
+    # Potvrzení = souvislá série `confirm_frames` zásahů (ne součet přes
+    # výpadky) + `appear_min_s`.  Publikují se JEN ohlášené stopy, takže
+    # k objektu v chatu existuje vždy i snímek.
+    'flicker_flips': 3,
+    'flicker_alt_tol_m': 0.25,
+    'flicker_neigh_beams': 4,
+    'solid_ratio_min': 0.5,
+    'edge_tol_m': 0.30,
+    'edge_max_points': 6,
+    'straightness_min': 0.35,
     # pozadí
     'bg_window_s': 60.0,        # délka okna klouzavého mediánu
     'bg_sample_dt': 0.5,        # jak často se scan ukládá do pozadí
@@ -87,7 +112,7 @@ DEFAULTS = {
     # filtr kandidátů
     'min_size_m': 0.15,         # kočka
     'max_size_m': 1.20,         # člověk / velký pes
-    'min_points_floor': 2,      # absolutní minimum (daleké objekty)
+    'min_points_floor': 3,      # absolutní minimum (daleké objekty); 2 paprsky = hrana, ne zvíře
     'min_points_near': 4,       # blíž než near_range_m chceme aspoň tolik bodů
     'near_range_m': 3.0,
     # sledování
@@ -134,6 +159,13 @@ class Track(object):
         self.last_seen = stamp
         self.hits = 1
         self.missed = 0
+        self.streak = 1              # zásahy V ŘADĚ (výpadek nuluje) — potvrzuje se souvislost, ne součet
+        # DŮKAZY (5. 9.): podíl nemihotavých paprsků ve shluku (EMA), kolikrát
+        # shluk vypadal jako odštěpek hrany, počet bodů a intenzita naposled.
+        self.solid = 1.0
+        self.edge_hits = 0
+        self.n_points = 0
+        self.intensity = None
         # SLEDOVÁNÍ POHYBU (majitel 2. 9.: „navrhni sledování objektů a jejich
         # pohybu"): stopa posledních poloh, směr pohybu, radiální rychlost
         # (záporná = přibližuje se k robotu) a z toho stav.  Vyhlazuje se
@@ -143,6 +175,32 @@ class Track(object):
         self.vy = 0.0
         self.radial = 0.0            # m/s vůči robotu: <0 blíž, >0 dál
         self.announced = False       # už ohlášen jako „objevil se"?
+
+    def note_cluster(self, c, alpha=0.4):
+        """Důkazy ze shluku, který stopu právě nakrmil."""
+        n = max(1, int(c.get('n') or 1))
+        solid = float(c.get('n_solid', n)) / n
+        self.solid = (1.0 - alpha) * self.solid + alpha * solid
+        if c.get('edge'):
+            self.edge_hits += 1
+        self.n_points = n
+        if c.get('intensity') is not None:
+            self.intensity = c['intensity']
+
+    def straightness(self, min_len_m=0.15):
+        """Přímost dráhy z posledních poloh: |konec − začátek| / délka dráhy.
+        1,0 = jde rovně, ~0 = poskakuje na místě.  None = stojí (dráha kratší
+        než `min_len_m`) nebo je stopa příliš krátká na úsudek."""
+        pts = self.path[-10:]
+        if len(pts) < 4:
+            return None
+        total = 0.0
+        for (x0, y0, _t0), (x1, y1, _t1) in zip(pts, pts[1:]):
+            total += math.hypot(x1 - x0, y1 - y0)
+        if total < min_len_m:
+            return None
+        net = math.hypot(pts[-1][0] - pts[0][0], pts[-1][1] - pts[0][1])
+        return net / total
 
     def update(self, cx, cy, size, stamp, alpha):
         dt = max(1e-3, stamp - self.last_seen)
@@ -163,6 +221,7 @@ class Track(object):
         self.size_max = max(self.size_max, size)
         self.last_seen = stamp
         self.hits += 1
+        self.streak = self.streak + 1 if self.missed == 0 else 1
         self.missed = 0
 
     @property
@@ -222,6 +281,8 @@ class ObjectDetector(object):
         self._bg_median = None
         self._last_bg_sample = None
         self.background_ready = False
+        self._flaky = None
+        self._alt_bg = None
         self.tracks = []
         self.events = []
 
@@ -265,7 +326,12 @@ class ObjectDetector(object):
             return self._bg_median
         if self._bg_dirty and self._bg_n > 0:
             self._bg_computed = now
-            with np.errstate(invalid='ignore'):
+            # Paprsek, který nikdy nic netrefil (158 z 860 v doku), dává
+            # v nanmedian „All-NaN slice" — očekávané, ale numpy to hlásí
+            # jako RuntimeWarning při každém přepočtu, a s nebufferovaným
+            # stdout to zaplavilo journal (5. 9.).  Potlačit tady, ne globálně.
+            with np.errstate(invalid='ignore'), warnings.catch_warnings():
+                warnings.simplefilter('ignore', category=RuntimeWarning)
                 # nanmedian: paprsek, který je občas inf (nic nezasáhl), se
                 # počítá jen z platných měření; když nikdy nic nevrátil, zůstane NaN
                 self._bg_median = np.nanmedian(self._bg_buf[:self._bg_n, :], axis=0)
@@ -273,8 +339,63 @@ class ObjectDetector(object):
                 # v klidu vlní.  ×1,4826 ≈ směrodatná odchylka.
                 dev = np.abs(self._bg_buf[:self._bg_n, :] - self._bg_median)
                 self._bg_mad = np.nanmedian(dev, axis=0) * 1.4826
+                self._flicker_stats()
             self._bg_dirty = False
         return self._bg_median
+
+    def _flicker_stats(self):
+        """MIHOTAVÉ PAPRSKY z okna pozadí (volá se při přepočtu mediánu).
+
+        Pro každý paprsek se v ČASOVÉM pořadí vzorků spočítá, kolikrát
+        přeskočil mezi „u mediánu" a „výrazně blíž" (`flips`) a kde ten bližší
+        mód leží (`alt` = medián bližších vzorků).  Stojící objekt dá jeden
+        přeskok (přišel a stojí), procházející člověk dva (přišel, odešel);
+        hrana, na které paprsek střídavě trefí bližší a vzdálenější plochu,
+        dá přeskoků mnoho.  Aby se za mihotání nevzal člověk, který třikrát
+        za minutu prošel stejnou cestou, musí bližší mód navíc SEDĚT NA
+        SCÉNĚ: buď na pozadí sousedních paprsků (hrana — paprsek se přesně
+        trefil do lomu mezi dvěma plochami), nebo do rozptylu vlastního
+        mediánu (šikmá plocha).  Člověk stojí v prázdném prostoru před zdí,
+        takže na nic z toho nesedí.
+        """
+        cfg = self.cfg
+        n, med = self._bg_n, self._bg_median
+        if n < 3 or med is None:
+            self._flaky = None
+            return
+        buf = self._bg_buf[:n, :]
+        if n == buf.shape[0] and self._bg_i:          # kruhový buffer → chronologicky
+            buf = np.roll(buf, -self._bg_i, axis=0)
+        with np.errstate(invalid='ignore'):
+            margin = np.maximum(cfg['fg_margin_m'], cfg['fg_margin_frac'] * med)
+            near = np.isfinite(buf) & np.isfinite(med) & (buf < (med - margin))
+            flips = np.count_nonzero(near[1:, :] != near[:-1, :], axis=0)
+            near_vals = np.where(near, buf, np.nan)
+            # nanmedian nad sloupci, které jsou celé NaN, jen varuje → potlačit
+            with warnings.catch_warnings():
+                warnings.simplefilter('ignore', category=RuntimeWarning)
+                alt = np.nanmedian(near_vals, axis=0)
+        mad = getattr(self, '_bg_mad', None)
+        sigma = np.where(np.isfinite(mad), np.maximum(mad, cfg['noise_floor_m']),
+                         cfg['noise_floor_m']) if mad is not None else \
+            np.full_like(med, cfg['noise_floor_m'])
+        tol = float(cfg['edge_tol_m'])
+        k = int(cfg['flicker_neigh_beams'])
+        # bližší mód sedí na pozadí některého ze sousedů (hrana) …
+        on_edge = np.zeros(med.shape, dtype=bool)
+        for s in range(1, k + 1):
+            for nb in (np.roll(med, s), np.roll(med, -s)):
+                on_edge |= np.isfinite(nb) & np.isfinite(alt) & (np.abs(alt - nb) < tol)
+        # … nebo do rozptylu vlastního mediánu (šikmá plocha, „dýchá" o víc než margin)
+        on_self = np.isfinite(alt) & (np.abs(alt - med) < np.maximum(tol, 3.0 * sigma))
+        # … anebo přeskakuje tak často (≥ 2× práh, tj. tři a víc epizod za
+        # minutu), že to člověk procházející kolem být nemůže — kabel, list,
+        # odraz: fyzicky „něco", ale ne zvíře, které se má hlásit.
+        many = flips >= 2 * int(cfg['flicker_flips'])
+        flaky = (flips >= int(cfg['flicker_flips'])) & np.isfinite(alt) & (on_edge | on_self | many)
+        self._flaky = flaky
+        self._alt_bg = np.where(flaky, alt, np.nan)
+        self._flips = flips
 
     def noise(self):
         """Klidové statistiky (pro payload i pro ladění prahů)."""
@@ -282,15 +403,26 @@ class ObjectDetector(object):
         if mad is None or not np.isfinite(mad).any():
             return {}
         fin = mad[np.isfinite(mad)]
-        return {'mad_median_m': round(float(np.median(fin)), 3),
-                'mad_p95_m': round(float(np.percentile(fin, 95)), 3),
-                'fg_points_p95': int(getattr(self, '_fg_p95', 0))}
+        out = {'mad_median_m': round(float(np.median(fin)), 3),
+               'mad_p95_m': round(float(np.percentile(fin, 95)), 3),
+               'fg_points_p95': int(getattr(self, '_fg_p95', 0))}
+        flaky = getattr(self, '_flaky', None)
+        if flaky is not None:
+            out['flaky_beams'] = int(np.count_nonzero(flaky))
+            flips = getattr(self, '_flips', None)
+            if flips is not None and flips.size:
+                out['flips_max'] = int(flips.max())
+        out['ghosts_dropped'] = int(getattr(self, '_ghosts', 0))
+        return out
 
     # -- jeden scan -------------------------------------------------------
-    def process(self, ranges, angle_min, angle_inc, stamp, range_max=None):
-        """Zpracuje scan, vrátí seznam POTVRZENÝCH objektů (dict).
+    def process(self, ranges, angle_min, angle_inc, stamp, range_max=None,
+                intensities=None):
+        """Zpracuje scan, vrátí seznam OHLÁŠENÝCH objektů (dict).
 
         ranges: list/np.array vzdáleností (inf/nan = nic)
+        intensities: volitelně odrazivost per paprsek — jen se zapisuje k
+        důkazům (mihotání na hraně bývá slabý odraz), nerozhoduje.
         """
         cfg = self.cfg
         r = np.asarray(ranges, dtype=np.float64)
@@ -302,7 +434,10 @@ class ObjectDetector(object):
         clusters = []
         if self.background_ready:
             bg = self._background()
-            clusters = self._clusters(r, bg, angle_inc)
+            inten = None
+            if intensities is not None and len(intensities) == r.shape[0]:
+                inten = np.asarray(intensities, dtype=np.float64)
+            clusters = self._clusters(r, bg, angle_inc, inten)
         self._track(clusters, stamp)
         return self.confirmed()
 
@@ -329,9 +464,31 @@ class ObjectDetector(object):
         # paprsek bez pozadí (vždycky inf, teď něco vidí) je taky popředí
         no_bg = ~np.isfinite(bg)
         closer = np.isfinite(bg) & (r < (bg - margin))
-        return valid & (closer | no_bg)
+        fg = valid & (closer | no_bg)
+        # MIHOTAVÝ PAPRSEK: návrat u jeho bližšího módu je známý povrch (hrana,
+        # šikmá plocha), ne objekt.  Objekt PŘED tou plochou je pořád vidět —
+        # musí být blíž než bližší mód o tutéž mez jako u pozadí.
+        alt = getattr(self, '_alt_bg', None)
+        if alt is not None and alt.shape == r.shape:
+            with np.errstate(invalid='ignore'):
+                known = np.isfinite(alt) & (np.abs(r - alt) < cfg['flicker_alt_tol_m'])
+                behind_alt = np.isfinite(alt) & (r >= (alt - margin))
+            fg &= ~(known | behind_alt)
+        return fg
 
-    def _clusters(self, r, bg, angle_inc):
+    def _edge_like(self, i0, i1, bg, rng):
+        """Malý shluk (paprsky i0..i1) v dosahu `edge_tol_m` od pozadí
+        některého ze sousedních paprsků = odštěpek stěny/hrany, ne těleso
+        v prostoru před ní."""
+        cfg = self.cfg
+        k = int(cfg['flicker_neigh_beams'])
+        n = bg.shape[0]
+        lo = [bg[(i0 - s) % n] for s in range(1, k + 1)]
+        hi = [bg[(i1 + s) % n] for s in range(1, k + 1)]
+        tol = float(cfg['edge_tol_m'])
+        return any(np.isfinite(v) and abs(float(v) - rng) < tol for v in lo + hi)
+
+    def _clusters(self, r, bg, angle_inc, inten=None):
         cfg = self.cfg
         mask = self._foreground_mask(r, bg)
         idx = np.nonzero(mask)[0]
@@ -342,6 +499,9 @@ class ObjectDetector(object):
         rr = r[idx]
         xs = rr * np.cos(ang)
         ys = rr * np.sin(ang)
+        flaky = getattr(self, '_flaky', None)
+        if flaky is None or flaky.shape != r.shape:
+            flaky = np.zeros(r.shape, dtype=bool)
 
         out = []
         start = 0
@@ -368,7 +528,17 @@ class ObjectDetector(object):
                 continue
             if n < self._min_points(rng, angle_inc):
                 continue
-            out.append({'x': cx, 'y': cy, 'size': size, 'range': rng, 'n': n})
+            beams = idx[sl]
+            c = {'x': cx, 'y': cy, 'size': size, 'range': rng, 'n': n,
+                 'n_solid': int(n - np.count_nonzero(flaky[beams])),
+                 'edge': (n <= int(cfg['edge_max_points'])
+                          and self._edge_like(int(beams[0]), int(beams[-1]), bg, rng))}
+            if inten is not None:
+                vals = inten[beams]
+                vals = vals[np.isfinite(vals)]
+                if vals.size:
+                    c['intensity'] = round(float(np.mean(vals)), 1)
+            out.append(c)
         return self._merge_close(out)
 
     def _merge_close(self, clusters, gap_m=0.55):
@@ -388,6 +558,10 @@ class ObjectDetector(object):
                 m['x'] = (m['x'] * m['n'] + c['x'] * c['n']) / n
                 m['y'] = (m['y'] * m['n'] + c['y'] * c['n']) / n
                 m['size'] = min(max(m['size'], c['size'], span), self.cfg['max_size_m'])
+                m['n_solid'] = m.get('n_solid', m['n']) + c.get('n_solid', c['n'])
+                m['edge'] = bool(m.get('edge')) and bool(c.get('edge'))
+                if m.get('intensity') is not None and c.get('intensity') is not None:
+                    m['intensity'] = round((m['intensity'] * m['n'] + c['intensity'] * c['n']) / n, 1)
                 m['n'] = n
                 m['range'] = math.hypot(m['x'], m['y'])
             else:
@@ -418,6 +592,7 @@ class ObjectDetector(object):
             if best is not None:
                 free.remove(best)
                 t.update(best['x'], best['y'], best['size'], stamp, cfg['speed_alpha'])
+                t.note_cluster(best, cfg['speed_alpha'])
             else:
                 t.missed += 1
         # UDÁLOSTI: potvrzený objekt, který zmizel, se ohlásí jako „odešel"
@@ -435,7 +610,18 @@ class ObjectDetector(object):
                                     'stamp': round(stamp, 2)})
         self.tracks = [t for t in self.tracks if t.missed <= cfg['max_missed']]
         for c in free:
-            self.tracks.append(Track(c['x'], c['y'], c['size'], stamp))
+            # NOVÁ STOPA jen z důvěryhodného shluku.  Shluk z většiny
+            # mihotavých paprsků nebo odštěpek hrany stopu nezaloží — počítá
+            # se jako „duch" (v payloadu `noise.ghosts_dropped`).  Už běžící
+            # stopu tohle neomezuje: člověk, který projde před mihotavou
+            # hranou, se krmí dál.
+            n = max(1, int(c.get('n') or 1))
+            if float(c.get('n_solid', n)) / n < cfg['solid_ratio_min'] or c.get('edge'):
+                self._ghosts = getattr(self, '_ghosts', 0) + 1
+                continue
+            t = Track(c['x'], c['y'], c['size'], stamp)
+            t.note_cluster(c, 1.0)
+            self.tracks.append(t)
 
     def classify(self, t):
         cfg = self.cfg
@@ -458,23 +644,53 @@ class ObjectDetector(object):
             return 'large'
         return 'unknown'
 
+    def evidence(self, t):
+        """Důkazy stopy pohromadě — do události (ať se dá zpětně ladit) i pro
+        rozhodnutí o ohlášení."""
+        return {'streak': int(t.streak), 'hits': int(t.hits),
+                'solid': round(float(t.solid), 2), 'edge_hits': int(t.edge_hits),
+                'points': int(t.n_points), 'straight': t.straightness(),
+                'size_spread_m': round(float(t.size_max - t.size_min), 2),
+                'intensity': t.intensity}
+
+    def _why_not(self, t, rng):
+        """None = stopa smí být ohlášena; jinak důvod (pro ladění)."""
+        cfg = self.cfg
+        need = cfg['confirm_frames'] if rng < cfg['far_range_m'] else cfg['far_confirm_frames']
+        if t.streak < need:
+            return 'streak %d<%d' % (t.streak, need)
+        if t.age_s < cfg['appear_min_s']:
+            return 'age %.1fs' % t.age_s
+        if rng > cfg['event_max_range_m']:
+            return 'range %.1fm' % rng
+        if t.solid < cfg['solid_ratio_min']:
+            return 'flaky beams (solid %.2f)' % t.solid
+        st = t.straightness()
+        if t.speed >= cfg.get('still_mps', 0.15) and st is not None and st < cfg['straightness_min']:
+            return 'jitter (straight %.2f)' % st
+        return None
+
     def confirmed(self):
+        """OHLÁŠENÉ stopy.  Ohlášení = jediná brána (souvislá série zásahů,
+        doba, dosah, pevné paprsky, přímost dráhy); co jí projde, dostane
+        událost `appeared` se snímkem a publikuje se, dokud stopa žije
+        (i přes krátký výpadek do `max_missed`).  Nic jiného se nepublikuje:
+        objekt v chatu bez snímku už nevznikne."""
         cfg = self.cfg
         out = []
         for t in self.tracks:
             rng = math.hypot(t.x, t.y)
-            need = cfg['confirm_frames'] if rng < cfg['far_range_m'] else cfg['far_confirm_frames']
-            if t.hits < need or t.missed > 0:
-                continue
-            if (not t.announced and t.age_s >= cfg['appear_min_s']
-                    and rng <= cfg['event_max_range_m']):
+            if not t.announced:
+                if t.missed > 0 or self._why_not(t, rng):
+                    continue
                 t.announced = True
                 self.events.append({'type': 'appeared', 'id': t.id,
                                     'cls': self.classify(t),
                                     'x': round(t.x, 2), 'y': round(t.y, 2),
                                     'sector': sector_of(math.degrees(math.atan2(t.y, t.x))),
                                     'range_m': round(math.hypot(t.x, t.y), 2),
-                                    'stamp': round(t.last_seen, 2)})
+                                    'stamp': round(t.last_seen, 2),
+                                    'evidence': self.evidence(t)})
             out.append({
                 'id': t.id,
                 'cls': self.classify(t),
@@ -491,6 +707,7 @@ class ObjectDetector(object):
                 'heading_deg': t.heading_deg,
                 'radial_mps': round(t.radial, 2),
                 'path': t.path[-10:],
+                'visible': t.missed == 0,
             })
         out.sort(key=lambda o: o['range_m'])
         return out
@@ -735,7 +952,8 @@ class LidarObjectsNode(object):
             stamp = msg.header.stamp.to_sec()
             objs = self.det.process(msg.ranges, msg.angle_min,
                                     msg.angle_increment, stamp,
-                                    range_max=msg.range_max)
+                                    range_max=msg.range_max,
+                                    intensities=msg.intensities or None)
             self.objects = [self._to_base_link(o) for o in objs]
             # UDÁLOSTI DO base_link.  Objekty se převáděly, události ne —
             # a base_scan je vůči base_link otočený o −90°, takže člověk

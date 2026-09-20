@@ -119,4 +119,32 @@ python3 nodes/lidar_objects.py                               # no build needed
 Parameters live in `config/lidar_objects.yaml`. While the robot drives, the
 static background is meaningless, so it is dropped and nothing is reported.
 
+### Flicker vs. a real object (2026-09-05)
+
+Only *announced* tracks are published, and every announcement carries an
+`appeared` event with a snapshot, so a reported object always has a picture.
+A track is announced when all of these hold:
+
+1. an unbroken run of hits (`confirm_frames`, `far_confirm_frames` beyond
+   `far_range_m`) — a miss resets the run, hits are not summed across gaps;
+2. tracked for at least `appear_min_s` and within `event_max_range_m`;
+3. at least `solid_ratio_min` of its beams are not *flaky* — a beam is flaky
+   when it flipped between "at the background" and "clearly nearer" at least
+   `flicker_flips` times inside the background window and its nearer mode
+   sits on the scene (a neighbour's background = an edge, or its own
+   median's spread = a grazing surface) or flips ≥ 2× the threshold. A
+   return within `flicker_alt_tol_m` of a flaky beam's nearer mode is a known
+   surface, not an object; an object *in front of* it is still seen;
+4. if it moves, its path goes somewhere: net displacement / path length ≥
+   `straightness_min` (random jitter fails this);
+5. a small cluster (≤ `edge_max_points`) whose range matches a neighbouring
+   beam's background within `edge_tol_m` is a chip of the wall and never seeds
+   a track.
+
+Each `appeared` event carries `evidence` (streak, hits, solid, straight,
+points, size spread, intensity) so thresholds can be tuned from
+`~/.vitulus/lidar_events/events.jsonl`; the payload's `noise` reports
+`flaky_beams` and `ghosts_dropped`.
+
 Unit test with synthetic scans: `python3 test/test_lidar_objects.py`.
+Replay real scans offline: `python3 test/replay_bag.py <bag> [--node old.py] [--flaky]`.

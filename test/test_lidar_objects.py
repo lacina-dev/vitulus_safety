@@ -92,7 +92,8 @@ def test_b_moving_object():
             return put_object(garage(0.01, rng), 3.0, y, 0.40)
         moves.append(f)
     det, res = run(frames + moves)
-    tail = res[len(frames) + 5:]
+    # ohlášení až po appear_min_s (1 s) — objekt v chatu má mít i snímek
+    tail = res[len(frames) + 12:]
     counts = [len(r) for r in tail]
     assert min(counts) >= 1, 'pohyblivý objekt zmizel (min %d)' % min(counts)
     assert max(counts) == 1, 'objekt se rozpadl na %d kusů' % max(counts)
@@ -285,6 +286,133 @@ def test_j_depth_height_classifies_person_dog_cat():
           % (out['člověk'][0], out['člověk'][1], out['pes'][0], out['pes'][1], out['kočka'][0], out['kočka'][1]))
 
 
+def _run_events(frames, cfg=None):
+    det = ObjectDetector(cfg or {'bg_min_samples': 8})
+    ev, res = [], []
+    for i, f in enumerate(frames):
+        res.append(det.process(f(i * DT), ANGLE_MIN, ANGLE_INC, i * DT))
+        ev.extend(det.take_events())
+    return det, res, ev
+
+
+def edge_flicker(rng, beams, near, far=WALL, episode_p=0.06, length=(2, 8)):
+    """HRANA, na které 2–4 paprsky náhodně přeskakují mezi vzdálenější
+    plochou (`far`) a bližší (`near`) — přesně to, co dělalo (−1,3; 3,75) a
+    (1,7; 4,75) v garáži: epizody 0,2–0,8 s, pár za minutu, pořád na témž
+    místě.  Vrací továrnu na rámce se stavem."""
+    state = {'left': 0}
+
+    def f(t):
+        r = garage(0.01, rng)
+        if state['left'] > 0:
+            state['left'] -= 1
+            for b in beams:
+                # smíšené pixely: každý paprsek jinde mezi bližší a
+                # vzdálenější plochou → shluk má radiální „rozměr" 0,2–0,3 m
+                # jako skutečné záznamy (size 0,16–0,35 m), ne 5 cm
+                r[b] = near - rng.random() * 0.25 + 0.05
+        elif rng.random() < episode_p:
+            state['left'] = rng.randint(*length)
+        return r
+    return f
+
+
+def test_k_recurring_edge_flicker_gives_nothing_but_person_is_seen():
+    """Opakované mihotání hrany: 3 paprsky přeskakují 4,0 m ↔ 3,75 m po
+    dobu 3 minut → 0 událostí (staré jádro jich dávalo desítky).  Potom
+    člověk 0,45 m projde PŘES tytéž paprsky → ohlášen."""
+    rng = random.Random(23)
+    beams = [519, 520, 521, 522, 523]        # ~45° vlevo vpředu, 5 paprsků
+    flick = edge_flicker(rng, beams, near=3.75)
+    frames = [flick for _ in range(int(180.0 / DT))]
+    det, res, ev = _run_events(frames)
+    assert not ev, 'mihotání hrany dalo události: %s' % [(e['type'], e.get('evidence')) for e in ev]
+    assert all(len(r) == 0 for r in res), 'mihotání hrany dalo objekt'
+    nz = det.noise()
+    assert nz.get('flaky_beams', 0) >= 2, 'mihotavé paprsky se měly poznat: %s' % nz
+    # člověk jde napříč přes hranu (y roste), 0,8 m/s ve 3,3 m
+    walk = []
+    for k in range(40):
+        def g(t, k=k):
+            r = flick(t)
+            return put_object(r, 2.4, 1.6 + 0.08 * k, 0.45)
+        walk.append(g)
+    det2, res2, ev2 = _run_events(frames + walk)
+    kinds = [e['type'] for e in ev2]
+    assert kinds[:1] == ['appeared'], 'člověk přes mihotavou hranu musí být ohlášen: %s' % kinds
+    seen_frames = [i for i, r in enumerate(res2) if r]
+    assert seen_frames and seen_frames[0] - len(frames) <= 20, \
+        'ohlášení do 2 s od příchodu (bylo po %d rámcích)' % (seen_frames[0] - len(frames))
+    print('K) mihotání hrany 3 min → 0 událostí, %d mihotavých paprsků, %d duchů zahozeno; '
+          'člověk přes tutéž hranu → appeared po %.1f s  OK'
+          % (nz.get('flaky_beams', 0), nz.get('ghosts_dropped', 0),
+             (seen_frames[0] - len(frames)) * DT))
+
+
+def test_l_random_jitter_cluster_is_not_an_object():
+    """Roztřesený shluk: 3 paprsky, které se každý rámec objeví JINDE
+    (náhodný směr 3–6 m, ale pořád před zdí) — pohyb bez směru není zvíře."""
+    rng = random.Random(29)
+    frames = warmup(rng, 30.0, 0.01)
+    jit = []
+    for k in range(60):
+        def f(t, k=k):
+            r = garage(0.01, rng)
+            b = 300 + rng.randint(-6, 6)         # ±2,5° kolem jednoho místa
+            for j in range(3):
+                r[b + j] = 3.0 + rng.random() * 0.9
+            return r
+        jit.append(f)
+    det, res, ev = _run_events(frames + jit)
+    assert not ev, 'roztřesený shluk dal události: %s' % [(e['type'], e.get('evidence')) for e in ev]
+    print('L) roztřesený shluk 6 s → 0 událostí, 0 objektů  OK')
+
+
+def test_m_far_person_crossing_is_reported_with_evidence():
+    """Člověk 0,5 m jde napříč v 6,5 m rychlostí 1,2 m/s (staré jádro
+    v > 5 m nehlásilo nic) → appeared s důkazy (série, pevné paprsky, přímost)."""
+    rng = random.Random(31)
+    wall = 8.0
+    def far_garage(t):
+        r = garage(0.01, rng)
+        return r * (wall / WALL)
+    frames = [far_garage for _ in range(int(30.0 / DT))]
+    walk = []
+    for k in range(40):
+        def f(t, k=k):
+            return put_object(far_garage(t), 6.5, -2.0 + 0.12 * k, 0.5)
+        walk.append(f)
+    det, res, ev = _run_events(frames + walk)
+    ap = [e for e in ev if e['type'] == 'appeared']
+    assert ap, 'člověk v 6,5 m nebyl ohlášen'
+    evd = ap[0]['evidence']
+    assert evd['streak'] >= 6 and evd['solid'] >= 0.9, 'důkazy: %s' % evd
+    assert evd['straight'] is None or evd['straight'] > 0.8, 'jde rovně: %s' % evd
+    assert 6.0 < ap[0]['range_m'] < 7.2, 'vzdálenost %.2f' % ap[0]['range_m']
+    print('M) člověk napříč v 6,5 m → appeared r=%.1f m, důkazy %s  OK' % (ap[0]['range_m'], evd))
+
+
+def test_n_still_cat_near_wall_is_reported_edge_only_for_wall_range():
+    """Kočka 0,25 m, která si sedne 0,8 m PŘED zeď a nehýbe se → ohlášena
+    (není to odštěpek zdi, je před ní); tři paprsky NA vzdálenosti zdi
+    vedle jejího lomu (odštěpek) → nic."""
+    rng = random.Random(37)
+    frames = warmup(rng, 30.0, 0.01)
+    cat = [(lambda t: put_object(garage(0.01, rng), 3.2, 0.4, 0.25)) for _ in range(30)]
+    det, res, ev = _run_events(frames + cat)
+    assert [e['type'] for e in ev] == ['appeared'], 'kočka před zdí: %s' % ev
+    assert ev[0]['cls'] == 'small', 'třída %s' % ev[0]['cls']
+    # odštěpek: 3 paprsky, které se ukážou 0,25 m před zdí přesně tam, kde
+    # sousední paprsky zeď vidí (hrana) — 3 s v kuse
+    def chip(t):
+        r = garage(0.01, rng)
+        r[600:603] = WALL - 0.25
+        return r
+    det2, res2, ev2 = _run_events(frames + [chip for _ in range(30)])
+    assert not ev2, 'odštěpek stěny nesmí být objekt: %s' % ev2
+    print('N) kočka 0,25 m před zdí → appeared small; odštěpek stěny 0,25 m → nic  OK')
+
+
 if __name__ == '__main__':
     fails = 0
     for fn in (test_a_empty_garage_noise, test_b_moving_object,
@@ -294,7 +422,11 @@ if __name__ == '__main__':
                test_g_sectors_and_noise_adaptive_threshold,
                test_h_far_flicker_gives_no_event,
                test_i_two_legs_are_one_person_and_track_survives_gaps,
-               test_j_depth_height_classifies_person_dog_cat):
+               test_j_depth_height_classifies_person_dog_cat,
+               test_k_recurring_edge_flicker_gives_nothing_but_person_is_seen,
+               test_l_random_jitter_cluster_is_not_an_object,
+               test_m_far_person_crossing_is_reported_with_evidence,
+               test_n_still_cat_near_wall_is_reported_edge_only_for_wall_range):
         try:
             fn()
         except AssertionError as e:
