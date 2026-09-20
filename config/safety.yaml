@@ -8,6 +8,9 @@ max_tilt_y: 30.0
 motor_timeout: 2.0          # seconds without state message to consider motor dead
 motor_check_rate: 5.0       # Hz - how often to check motor states
 startup_grace: 10.0         # seconds after start to skip motor checks (system boot time)
+# Motors are checked only while the power-module motor output is ON (they are OFF
+# after boot and while docked - no motor state then is normal, not a failure).
+motor_power_on_grace: 8.0   # seconds after motor power-on to skip motor checks
 
 # Temperature limits (Celsius)
 motor_max_temp: 70.0        # max drive motor temperature before shutdown

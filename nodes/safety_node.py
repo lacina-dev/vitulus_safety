@@ -4,7 +4,7 @@ import rospy
 import math
 from std_msgs.msg import Bool, Int16, String
 from sensor_msgs.msg import Imu
-from vitulus_msgs.msg import Moteus_controller_state, Mower
+from vitulus_msgs.msg import Moteus_controller_state, Mower, Power_status
 
 
 def quaternion_to_euler(x, y, z, w):
@@ -35,6 +35,7 @@ class SafetyMonitor:
         self.motor_check_rate = rospy.get_param('~motor_check_rate', 5.0)
         self.alarm_melody = rospy.get_param('~alarm_melody', 4)
         self.startup_grace = rospy.get_param('~startup_grace', 10.0)
+        self.motor_power_on_grace = rospy.get_param('~motor_power_on_grace', 8.0)
         self.motor_max_temp = rospy.get_param('~motor_max_temp', 70.0)
         self.mower_max_temp = rospy.get_param('~mower_max_temp', 70.0)
 
@@ -49,6 +50,12 @@ class SafetyMonitor:
         ]
         self.motors_killed = False
         self.motors_killed_by_temp = False
+        # Drive motor supply (power module motor output). None = never reported
+        # (no power module) -> legacy behaviour: motors are always checked.
+        # Motors are OFF after boot and while docked; unpowered controllers send
+        # no state, which is NOT a failure.
+        self.motor_supply_on = None
+        self.motor_supply_on_time = None
         self.mower_stopped_by_tilt = False
         self.mower_stopped_by_temp = False
 
@@ -64,6 +71,9 @@ class SafetyMonitor:
         rospy.Subscriber('/base/front_right_wheel_state', Moteus_controller_state, self.motor_state_cb)
         rospy.Subscriber('/base/rear_left_wheel_state', Moteus_controller_state, self.motor_state_cb)
         rospy.Subscriber('/base/rear_right_wheel_state', Moteus_controller_state, self.motor_state_cb)
+
+        # Subscriber - power module (is the drive motor supply switched on?)
+        rospy.Subscriber('/pm/power_status', Power_status, self.power_status_cb)
 
         # Subscriber - IMU
         rospy.Subscriber('bno085/imu', Imu, self.imu_cb)
@@ -84,6 +94,18 @@ class SafetyMonitor:
         rospy.logwarn("[safety] %s", message)
         self.pub_log_info.publish(String(data="[SAFETY] " + message))
 
+    def power_status_cb(self, msg):
+        """Track the drive motor supply; re-arm the motor monitor on every power-on."""
+        supply_on = bool(msg.motor_out_switch)
+        if supply_on and not self.motor_supply_on:
+            # Deliberate power-on: forget states from before the power-off and
+            # monitor again (a persisting failure kills the motors again).
+            self.motor_states = {}
+            self.motor_supply_on_time = rospy.Time.now()
+            self.motors_killed = False
+            self.motors_killed_by_temp = False
+        self.motor_supply_on = supply_on
+
     def motor_state_cb(self, msg):
         """Update motor state tracking."""
         self.motor_states[msg.name] = {
@@ -103,6 +125,15 @@ class SafetyMonitor:
             return
 
         now = rospy.Time.now()
+
+        # Motors deliberately unpowered (boot default, docked): nothing to check.
+        if self.motor_supply_on is False:
+            return
+        # Just powered on: controllers need a moment before they report.
+        if (self.motor_supply_on_time is not None and
+                (now - self.motor_supply_on_time).to_sec() < self.motor_power_on_grace):
+            return
+
         all_ok = True
         problem_motors = []
         overtemp_motors = []
