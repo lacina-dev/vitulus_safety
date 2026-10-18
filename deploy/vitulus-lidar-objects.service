@@ -1,0 +1,20 @@
+# Zdroj user unitu ~/.config/systemd/user/vitulus-lidar-objects.service
+# Instalace: cp deploy/vitulus-lidar-objects.service ~/.config/systemd/user/ \
+#   && systemctl --user daemon-reload && systemctl --user restart vitulus-lidar-objects
+[Unit]
+Description=Vitulus — detekce objektů z lidaru (/safety/lidar_objects), jen čtení /scan
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=/bin/bash -lc 'source /home/vitulus/catkin_ws/devel/setup.bash && exec python3 -u /home/vitulus/catkin_ws/src/vitulus/vitulus_safety/nodes/lidar_objects.py'
+Restart=always
+RestartSec=15
+# Kód 3 = záměrný konec při ztrátě ROS masteru (cb_master v lidar_objects.py),
+# aby se uzel po restartu masteru znovu zaregistroval — není to selhání.
+SuccessExitStatus=3
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=default.target
