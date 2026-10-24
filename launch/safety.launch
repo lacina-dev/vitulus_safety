@@ -5,13 +5,13 @@
     <arg name="lidar_objects" default="false"/>
 
     <node name="safety_node" pkg="vitulus_safety" type="safety_node.py"
-          respawn="true" respawn_delay="5" output="screen">
+          respawn="true" respawn_delay="5" output="log">
         <rosparam file="$(find vitulus_safety)/config/safety.yaml" command="load"/>
     </node>
 
     <node if="$(arg lidar_objects)"
           name="lidar_objects" pkg="vitulus_safety" type="lidar_objects.py"
-          respawn="true" respawn_delay="5" output="screen">
+          respawn="true" respawn_delay="5" output="log">
         <rosparam file="$(find vitulus_safety)/config/lidar_objects.yaml" command="load"/>
     </node>
 </launch>
