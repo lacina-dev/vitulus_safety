@@ -9,6 +9,17 @@
         <rosparam file="$(find vitulus_safety)/config/safety.yaml" command="load"/>
     </node>
 
+    <!-- map_rules_guard: pravidla z mapy (nogo, slow, noblade) pro software a nůž.
+         Vypnutí za běhu: rosparam set /map_rules_guard/enabled false. -->
+    <arg name="map_rules" default="true"/>
+    <node if="$(arg map_rules)"
+          name="map_rules_guard" pkg="vitulus_safety" type="map_rules_guard"
+          respawn="true" respawn_delay="1" output="log">
+        <param name="enabled" value="true"/>
+        <param name="footprint_file"
+               value="$(find vitulus_navi)/config/costmap_common_params.yaml"/>
+    </node>
+
     <node if="$(arg lidar_objects)"
           name="lidar_objects" pkg="vitulus_safety" type="lidar_objects.py"
           respawn="true" respawn_delay="5" output="log">

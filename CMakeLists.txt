@@ -19,6 +19,7 @@ catkin_package(
 catkin_install_python(PROGRAMS
   nodes/safety_node.py
   nodes/lidar_objects.py
+  nodes/map_rules_guard
   DESTINATION ${CATKIN_PACKAGE_BIN_DESTINATION}
 )
 

@@ -15,6 +15,17 @@ motor_power_on_grace: 8.0   # seconds after motor power-on to skip motor checks
 # Temperature limits (Celsius)
 motor_max_temp: 70.0        # max drive motor temperature before shutdown
 mower_max_temp: 70.0        # max mower motor temperature before shutdown
+# 3 s of consecutive samples, or the hard limit for 1.5 s: one window of 1 s must not
+# stop a program (1. 11. 2026: 90.7 C for one window, motor at 20 C). The firmware's
+# own 1 s trip still stops the blade. Reasoning in nodes/safety_node.py.
+mower_cool_temp: 55.0       # re-arm, the firmware's TEMP_COOL
+mower_hard_temp: 100.0
+mower_temp_sustain_s: 3.0
+mower_temp_hard_s: 1.5
+mower_temp_max_rate_c_s: 5.0   # real motor: 0.2 C/min; 264 W peak into 400 J/K: 0.7 C/s
+mower_temp_valid_min: -30.0    # open NTC reads -273
+mower_temp_valid_max: 150.0    # shorted NTC reads 200 and more
+mower_temp_fault_s: 3.0
 
 # Alarm melody ID for power module buzzer
 alarm_melody: 4

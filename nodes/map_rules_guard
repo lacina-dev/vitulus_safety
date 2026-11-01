@@ -1,0 +1,915 @@
+#!/usr/bin/env python3
+"""map_rules_guard - the map's rules bind all autonomous motion and the blade.
+
+The contract is docs/MAP_OBJECTS.md in vitulus_mapping, section 5.  This node
+reads map->base_link and the active rules, tells cmd_vel_mux how fast software
+may go, and keeps the blade off over a noblade area.  People are never limited
+(the mux does not clamp them): the node warns when a person drives into a nogo.
+
+Motion, /cmd_vel_mux/limit at 5 Hz:
+  slow   v_fwd and v_back capped to speed_mps while the footprint overlaps,
+         released ~hysteresis_m after it left, so a boundary under the
+         localization noise does not make the speed flap.
+  nogo   v_fwd / v_back taper to 0 at ~stop_margin_m of footprint clearance
+         ALONG that direction, from the stopping distance at ~brake_decel and
+         ~latency_s.  A nogo beside the robot does not slow it down.  w_left /
+         w_right taper with the angle left before the turning footprint comes
+         within ~rotate_margin_m, so a turn away stays free.
+  inside a nogo: a direction whose ~overlap_step_m does not add overlap (within
+         ~overlap_tol_m2, the noise along a fence) at ~escape_v, the turn that
+         does not add overlap at ~escape_w.  Boxed in on all sides: ~escape_w
+         on the turn with the most room.
+  map->base_link older than ~tf_max_age_s, or a nogo that cannot be read, with
+  rules present: all zero.
+No rules: `rules: 0` and nothing else, no blade command ever.
+
+Rules in force (`RuleFeed`): nothing goes out until the first /map_objects/rules,
+or ~no_publisher_s after the start whoever is connected: then the served site's
+files (load_rules), reloaded every ~file_reload_s until the topic speaks, so a
+temporary rule starts and a site change works with map_objects_server down.  When
+they cannot be read, a limit engaged before stays stale: a respawn never releases
+the mux.  A message without `rules` is ignored.  Site null while a program
+runs is a mapping_manager restart, not an empty map: the rules stay.  Rules of
+another site than the served one do not apply.
+
+Blade (`Blade`): only /mower/set_motor_on, never rpm 0 and never set_power.
+False at most 1 Hz while the footprint is on a noblade area, a program runs and
+the blade spins or is owed: smach recovery switches it on again and the firmware
+retries by itself after an ERR.  True on exit only with proof the mission wants
+it: the firmware reported RUN (rpm alone is a coast-down) or somebody else said
+True, nobody else has said False since (the mission's transit and detour stops
+stay stops), the program still runs and no stop reason exists.  In
+TEMP/ERR/BLOCKED the firmware refuses or handles it: the True waits.  Not within
+~blade_on_gap_s of the last False.  A soft start gets ~soft_start_s.  A True from
+another node on the area is answered at once, the 1 Hz is the periodic re-assert.
+A True owed before a respawn is never sent: nobody saw what the mission did
+meanwhile, and the blade is not started on what cannot be verified.  Rosparam
+~blade_owed {program, stamp} exists only to say so: the same program still runs
+without a blade -> `restore_failed` and a warning, the mission carries on.  The
+off side needs no memory, it works from what is seen after the restart.
+
+Dock: a nogo in the corridor UNDOCK-DOCK-DOCKED (footprint + stop margin) will
+stop the approach.  That is not hidden: warning + state `dock`, and the docking
+watchdog ends the stage with its stall reason.
+
+~enabled false: `rules: 0`, the blade is handed back, read every tick.
+
+  in  /map_objects/rules, /map_objects/objects (dock points), /cmd_vel_mux/active,
+      /mower/status, /mower/set_motor_on (others' commands), /mower_smach/busy,
+      /mower_smach/active_program, /mower_smach/stop_reason
+  out /cmd_vel_mux/limit, /mower/set_motor_on,
+      /map_rules/state (latched JSON {"in", "near", "limit", "blade", "dock"})
+      /map_rules/warning (JSON {"type", "name", "text"})
+"""
+import json
+import math
+import time
+
+from shapely import make_valid
+from shapely.geometry import LineString, MultiPolygon, Polygon
+from shapely.ops import unary_union
+
+SOURCE = 'map_rules'
+HUMAN_INPUTS = ('ds4', 'teleop')
+MOWER_FAULTS = ('ERR', 'BLOCKED', 'TEMP')
+DOCK_POINTS = ('UNDOCK', 'DOCK', 'DOCKED')     # in corridor order, any case
+# vitulus_navi/config/costmap_common_params.yaml, used when that file is unreadable.
+FOOTPRINT = [[0.238, -0.256], [0.238, 0.256], [-0.238, 0.256], [-0.238, 0.050],
+             [-0.288, 0.05], [-0.288, -0.05], [-0.238, -0.05], [-0.238, -0.256]]
+
+DEFAULTS = {
+    'rate_hz': 5.0, 'tf_max_age_s': 1.0,
+    # base_common.yaml limits: "no cap", FAST reaches 0.75 m/s and 1.5 rad/s
+    'v_fwd_max': 1.4, 'v_back_max': 1.4, 'w_max': 1.75,
+    'stop_margin_m': 0.15, 'brake_decel': 0.25, 'latency_s': 0.4, 'lookahead_m': 2.0,
+    'brake_ang': 0.8, 'rotate_look_rad': 1.2, 'rotate_step_rad': 0.05,
+    'rotate_margin_m': 0.02, 'escape_v': 0.15, 'escape_w': 0.2,
+    'overlap_step_m': 0.1, 'overlap_tol_m2': 0.003, 'turn_noise_m': 0.015,
+    'hysteresis_m': 0.10, 'near_m': 1.0, 'slow_default': 0.20,
+    'blade_on_rpm': 300, 'blade_period_s': 1.0, 'soft_start_s': 6.0, 'restore_attempts': 3,
+    'owed_refresh_s': 5.0, 'owed_wait_s': 3.0, 'blade_on_gap_s': 3.0, 'no_publisher_s': 5.0,
+    'file_reload_s': 5.0,
+}
+MIN_STEP = 0.01
+TOUCH = 1e-4
+
+
+def stop_speed(room, decel, latency):
+    """The speed that can still stop within `room` (v*latency + v^2/2a = room)."""
+    if room <= 0.0:
+        return 0.0
+    speed = -decel * latency + math.sqrt((decel * latency) ** 2 + 2.0 * decel * room)
+    return speed if speed >= MIN_STEP else 0.0
+
+
+def dated(now, age, tol=0.1):
+    """The time of a transform `age` seconds old.  From the future (the clock
+    stepped back) it says nothing: None, and the old pose goes stale."""
+    return None if age < -tol else now - max(age, 0.0)
+
+
+def finite_bounds(points):
+    """(minx, miny, maxx, maxy) of what can be read of `points`, else None."""
+    try:
+        pts = [(float(x), float(y)) for x, y in points]
+    except (TypeError, ValueError):
+        return None
+    pts = [p for p in pts if math.isfinite(p[0]) and math.isfinite(p[1])]
+    if not pts:
+        return None
+    xs, ys = zip(*pts)
+    return min(xs), min(ys), max(xs), max(ys)
+
+
+def area_of(points):
+    """[[x, y]] -> the (multi)polygon, a bowtie keeps both lobes.  ValueError when
+    no area comes out of it."""
+    pts = [(float(x), float(y)) for x, y in points]
+    if len(pts) < 3 or not all(math.isfinite(v) for p in pts for v in p):
+        raise ValueError('not an outline')
+    poly = Polygon(pts)
+    if not poly.is_valid:
+        poly = make_valid(poly)
+    parts = [g for g in getattr(poly, 'geoms', [poly]) if isinstance(g, (Polygon, MultiPolygon))]
+    area = unary_union(parts) if parts else None
+    if area is None or area.is_empty:
+        raise ValueError('empty area')
+    return area
+
+
+class RuleFeed(object):
+    """What /map_objects/rules means right now.  Pure."""
+
+    def __init__(self, params=None, warn=None):
+        self.p = dict(DEFAULTS)
+        self.p.update(params or {})
+        self.warn = warn or (lambda text: None)
+        self.msg = None
+        self.served = None           # /mapping_manager/status, None = not known
+        self.decided = False
+        self.start_t = None
+        self.from_files = False
+        self.loaded_t = None
+        self.said_null = False
+
+    def on_rules(self, raw):
+        try:
+            msg = json.loads(raw)
+            if not isinstance(msg.get('rules'), list):
+                raise ValueError('no rules list')
+        except (ValueError, TypeError, AttributeError) as exc:
+            self.warn('map_rules_guard: /map_objects/rules ignored: %s' % exc)
+            return
+        self.msg = msg
+        self.from_files = False
+
+    def on_status(self, raw):
+        try:
+            serving = json.loads(raw).get('serving')
+        except (ValueError, TypeError, AttributeError):
+            return
+        self.served = serving.get('site') if isinstance(serving, dict) else None
+
+    def current(self, running):
+        """The rules that apply, None = keep what is in force."""
+        if self.msg is None:
+            return None
+        site = self.msg.get('site')
+        if site is None and running:
+            if not self.said_null:
+                self.said_null = True
+                self.warn('map_rules_guard: site null during a program, rules kept')
+            return None
+        self.said_null = False
+        self.decided = True
+        if site is not None and self.served is not None and site != self.served:
+            return []
+        return self.msg['rules']
+
+    def ready(self, now, load=None, engaged=False):
+        """May the guard speak?  `load(site)` reads the rules from the files, None
+        when it cannot tell; `engaged` = a limit stood before this restart."""
+        if self.start_t is None:
+            self.start_t = now
+        if self.decided and self.from_files and load is not None:
+            self._reload(now, load)
+        if self.decided:
+            return True
+        if now - self.start_t < self.p['no_publisher_s']:
+            return False
+        if load is not None and self.served is not None and (
+                self.loaded_t is None or now - self.loaded_t >= 1.0):
+            self.loaded_t = now
+            rules = load(self.served)
+            if rules is not None:
+                self._from_files(rules)
+                return False          # the next tick decides on them, no empty tick
+        return not engaged
+
+    def _from_files(self, rules):
+        self.msg = {'site': self.served, 'rules': rules}
+        self.from_files = True
+
+    def _reload(self, now, load):
+        if self.served is None:
+            return
+        moved = self.msg.get('site') != self.served
+        wait = 1.0 if moved else self.p['file_reload_s']
+        if self.loaded_t is not None and now - self.loaded_t < wait:
+            return
+        self.loaded_t = now
+        rules = load(self.served)
+        if rules is not None:
+            self._from_files(rules)
+        elif moved:                   # rules of the old map no more, none of the new
+            self.msg = None
+            self.decided = False
+
+
+class Rule(object):
+    def __init__(self, raw, poly):
+        self.id = str(raw.get('id'))
+        self.type = raw.get('type')
+        self.name = str(raw.get('name', ''))
+        self.poly = poly
+        self.speed = raw.get('speed_mps')
+
+    def item(self):
+        return {'id': self.id, 'type': self.type, 'name': self.name}
+
+
+class Rules(object):
+    """Rules against a pose.  Pure: no ROS, the clock is passed in."""
+
+    def __init__(self, footprint=None, params=None, warn=None):
+        self.p = dict(DEFAULTS)
+        self.p.update(params or {})
+        self.fp = [(float(x), float(y)) for x, y in (footprint or FOOTPRINT)]
+        self.warn = warn or (lambda text: None)
+        self.rules = []
+        self.count = 0
+        self.bad = []                # [{type, name}] rules that cannot be read
+        self.bad_noblade = []        # their bounds (minx, miny, maxx, maxy), None = unknown
+        self.nogo = None             # union of the nogo areas
+        self.pose = None             # (t, x, y, yaw)
+        self.held = set()            # ids of slow/noblade rules we are still "in"
+        self.human = False
+        self.warned = set()          # nogo ids already warned about this entry
+        self.dock_line = None
+
+    def hard_stop(self):
+        """The name of an unreadable rule that may be a nogo, None without one."""
+        for item in self.bad:
+            if item['type'] not in ('slow', 'noblade'):
+                return item['name']
+        return None
+
+    # -- inputs -------------------------------------------------------------
+    def set_rules(self, rules):
+        """The `rules` list of /map_objects/rules.  A rule that cannot be read
+        counts in `rules` and is listed in `bad`; as a nogo, or as anything that
+        may be one, it stops software (limit)."""
+        out, bad, bad_noblade = [], [], []
+        for raw in rules or []:
+            try:
+                if raw.get('bad'):     # map_objects_server's marker, points or not
+                    raise ValueError(raw['bad'])
+                out.append(Rule(raw, area_of(raw['points'])))
+            except Exception as exc:  # noqa: BLE001 - GEOS raises its own, anything goes
+                info = raw if isinstance(raw, dict) else {}
+                bad.append({'type': info.get('type'), 'name': str(info.get('name', ''))})
+                self.warn('rule %r unusable: %s' % (bad[-1], exc))
+                if info.get('type') == 'noblade':
+                    bad_noblade.append(finite_bounds(info.get('points')))
+        self.rules = out
+        self.bad = bad
+        self.bad_noblade = bad_noblade
+        self.count = len(rules or [])
+        nogos = [r.poly for r in out if r.type == 'nogo']
+        self.nogo = unary_union(nogos) if nogos else None
+        self.held &= {r.id for r in out}
+
+    def set_pose(self, now, x, y, yaw):
+        self.pose = (now, x, y, yaw)
+
+    def set_human(self, active):
+        self.human = active in HUMAN_INPUTS
+
+    def set_dock_points(self, objects):
+        """/map_objects/objects `objects`: the corridor in order, None without it."""
+        pts = {str(o.get('name')).upper(): o.get('points') for o in objects or []
+               if o.get('family') == 'waypoint'
+               and str(o.get('name')).upper() in DOCK_POINTS}
+        line = [pts[n][0] for n in DOCK_POINTS if pts.get(n)]
+        self.dock_line = LineString(line) if len(line) >= 2 else None
+
+    # -- geometry -----------------------------------------------------------
+    def footprint(self, x, y, yaw):
+        c, s = math.cos(yaw), math.sin(yaw)
+        return Polygon([(x + c * fx - s * fy, y + s * fx + c * fy) for fx, fy in self.fp])
+
+    def fresh(self, now):
+        return self.pose is not None and now - self.pose[0] <= self.p['tf_max_age_s']
+
+    def _gap(self, sign):
+        """How far the footprint can go along +1 front / -1 rear, inf = free."""
+        _t, x, y, yaw = self.pose
+        c, s = math.cos(yaw) * sign, math.sin(yaw) * sign
+        run = 0.0
+        while run < self.p['lookahead_m']:
+            dist = self.footprint(x + c * run, y + s * run, yaw).distance(self.nogo)
+            if dist < TOUCH:
+                return run
+            run += max(dist, MIN_STEP)
+        return float('inf')
+
+    def _turn_room(self, sign):
+        """The angle left before the turn along `sign` (+ left) closes on a nogo.
+        A turn that opens the gap is free."""
+        _t, x, y, yaw = self.pose
+        step = self.p['rotate_step_rad']
+        start = self.footprint(x, y, yaw).distance(self.nogo)
+        # Near a parallel edge any turn closes a corner a little: within the noise
+        # of where it started that is no sweeping in, contact always is.
+        floor = max(TOUCH, min(self.p['rotate_margin_m'], start - self.p['turn_noise_m']))
+        angle = step
+        room = 0.0
+        while angle <= self.p['rotate_look_rad'] + 1e-9:
+            if self.footprint(x, y, yaw + sign * angle).distance(self.nogo) < floor:
+                return room
+            room = angle
+            angle += step
+        return float('inf')
+
+    def _turn_speed(self, sign):
+        room = self._turn_room(sign)
+        if room == float('inf'):
+            return self.p['w_max']
+        return min(self.p['w_max'], stop_speed(room, self.p['brake_ang'], self.p['latency_s']))
+
+    def _nogo_limit(self):
+        p = self.p
+        _t, x, y, yaw = self.pose
+        body = self.footprint(x, y, yaw)
+        if body.distance(self.nogo) > p['lookahead_m'] + 1.0:
+            return p['v_fwd_max'], p['v_back_max'], p['w_max'], p['w_max']
+        if body.intersects(self.nogo):
+            return self._leaving(body)
+        speed = {}
+        for sign, top in ((1.0, p['v_fwd_max']), (-1.0, p['v_back_max'])):
+            gap = self._gap(sign)
+            speed[sign] = top if gap == float('inf') else min(
+                top, stop_speed(gap - p['stop_margin_m'], p['brake_decel'], p['latency_s']))
+        left, right = self._turn_speed(1.0), self._turn_speed(-1.0)
+        if not (speed[1.0] or speed[-1.0] or left or right):
+            left, right = self._boxed_in(body)
+        return speed[1.0], speed[-1.0], left, right
+
+    def _leaving(self, body):
+        """Limits with the footprint on a nogo: what does not add overlap."""
+        p = self.p
+        _t, x, y, yaw = self.pose
+        here = body.intersection(self.nogo).area
+        step = p['overlap_step_m']
+        c, s = math.cos(yaw) * step, math.sin(yaw) * step
+
+        def adds(fp):
+            return fp.intersection(self.nogo).area > here + p['overlap_tol_m2']
+
+        turned = {sign: self.footprint(x, y, yaw + sign * 0.1).intersection(self.nogo).area
+                  for sign in (1.0, -1.0)}
+        least = min(turned.values())
+        turn_ok = {sign: area <= max(here + p['overlap_tol_m2'], least + 1e-6)
+                   for sign, area in turned.items()}
+        return (0.0 if adds(self.footprint(x + c, y + s, yaw)) else p['escape_v'],
+                0.0 if adds(self.footprint(x - c, y - s, yaw)) else p['escape_v'],
+                p['escape_w'] if turn_ok[1.0] else 0.0,
+                p['escape_w'] if turn_ok[-1.0] else 0.0)
+
+    def _boxed_in(self, body):
+        """Nothing is allowed: the turn with the most room stays, at ~escape_w."""
+        _t, x, y, yaw = self.pose
+        step = self.p['rotate_step_rad']
+        left = self.footprint(x, y, yaw + step).distance(self.nogo)
+        right = self.footprint(x, y, yaw - step).distance(self.nogo)
+        return (self.p['escape_w'] if left >= right else 0.0,
+                self.p['escape_w'] if right >= left else 0.0)
+
+    def _overlaps(self, rule):
+        """`rule` holds the footprint, with hysteresis for what is released."""
+        _t, x, y, yaw = self.pose
+        dist = self.footprint(x, y, yaw).distance(rule.poly)
+        if dist <= 0.0:
+            self.held.add(rule.id)
+            return True
+        if rule.id in self.held and dist < self.p['hysteresis_m']:
+            return True
+        self.held.discard(rule.id)
+        return False
+
+    def _slow_speed(self, rule):
+        try:
+            speed = float(rule.speed)
+        except (TypeError, ValueError):
+            speed = self.p['slow_default']
+        if not math.isfinite(speed):
+            speed = self.p['slow_default']
+        return max(0.05, min(0.40, speed))
+
+    # -- outputs ------------------------------------------------------------
+    def limit(self, now, stamp=None):
+        """The /cmd_vel_mux/limit dict."""
+        p = self.p
+        out = {'source': SOURCE, 'stamp': now if stamp is None else stamp,
+               'rules': self.count, 'reason': ''}
+        fwd, back, left, right = p['v_fwd_max'], p['v_back_max'], p['w_max'], p['w_max']
+        if self.count and not self.fresh(now):
+            fwd = back = left = right = 0.0
+            out['reason'] = 'tf_stale'
+        elif self.hard_stop() is not None:
+            fwd = back = left = right = 0.0
+            out['reason'] = 'nogo_unparsable:%s' % self.hard_stop()
+        elif self.count:
+            for rule in self.rules:
+                if rule.type == 'slow' and self._overlaps(rule):
+                    cap = self._slow_speed(rule)
+                    if cap < min(fwd, back):
+                        out['reason'] = 'slow:%s' % rule.name
+                    fwd, back = min(fwd, cap), min(back, cap)
+            if self.nogo is not None:
+                nf, nb, nl, nr = self._nogo_limit()
+                if nf < fwd or nb < back or nl < left or nr < right:
+                    out['reason'] = 'nogo:%s' % self._nearest_nogo()
+                fwd, back, left, right = min(fwd, nf), min(back, nb), nl, nr
+        out.update(v_fwd=round(fwd, 3), v_back=round(back, 3), w=round(max(left, right), 3),
+                   w_left=round(left, 3), w_right=round(right, 3))
+        return out
+
+    def _nearest_nogo(self):
+        _t, x, y, yaw = self.pose
+        body = self.footprint(x, y, yaw)
+        rules = [r for r in self.rules if r.type == 'nogo']
+        return min(rules, key=lambda r: body.distance(r.poly)).name
+
+    def inside(self, now):
+        """[rule items] under the footprint, near [nogo items with dist_m]."""
+        if self.pose is None or not self.fresh(now):
+            return [], []
+        _t, x, y, yaw = self.pose
+        body = self.footprint(x, y, yaw)
+        inside, near = [], []
+        for rule in self.rules:
+            dist = body.distance(rule.poly)
+            if dist <= 0.0:
+                inside.append(rule.item())
+            elif rule.type == 'nogo' and dist <= self.p['near_m']:
+                near.append(dict(rule.item(), dist_m=round(dist, 2)))
+        return inside, near
+
+    def on_noblade(self, now):
+        """True/False, None when the pose is not known."""
+        noblade = [r for r in self.rules if r.type == 'noblade']
+        if not noblade and not self.bad_noblade:
+            return False
+        if not self.fresh(now):
+            return None
+        hit = self._maybe_on_bad_noblade()
+        for rule in noblade:
+            hit = self._overlaps(rule) or hit
+        return hit
+
+    def _maybe_on_bad_noblade(self):
+        """An unreadable noblade counts where the footprint could overlap it."""
+        _t, x, y, yaw = self.pose
+        minx, miny, maxx, maxy = self.footprint(x, y, yaw).bounds
+        for box in self.bad_noblade:
+            if box is None or (minx <= box[2] and maxx >= box[0]
+                               and miny <= box[3] and maxy >= box[1]):
+                return True
+        return False
+
+    def human_warnings(self, now):
+        """Warnings for nogo areas a person has just driven into."""
+        inside = {i['id']: i for i in self.inside(now)[0] if i['type'] == 'nogo'}
+        self.warned &= set(inside)
+        if not self.human:
+            return []
+        out = []
+        for rid, item in inside.items():
+            if rid not in self.warned:
+                self.warned.add(rid)
+                out.append({'type': 'nogo', 'name': item['name'],
+                            'text': 'Driving into no-go area %s.' % item['name']})
+        return out
+
+    def dock_conflicts(self):
+        """Names of the nogo areas that block the dock corridor."""
+        if self.dock_line is None:
+            return []
+        reach = max(max(abs(x), abs(y)) for x, y in self.fp)
+        lane = self.dock_line.buffer(reach + self.p['stop_margin_m'])
+        return sorted(r.name for r in self.rules if r.type == 'nogo' and lane.intersects(r.poly))
+
+
+class Blade(object):
+    """When the guard says False or True.  Pure.  `update` returns the commands."""
+
+    def __init__(self, params=None):
+        self.p = dict(DEFAULTS)
+        self.p.update(params or {})
+        self.status = None
+        self.rpm = 0
+        self.busy = None              # /mower_smach/busy, None = unknown
+        self.program = ''
+        self.stop_reason = ''
+        self.stopped = False          # the guard owes a True
+        self.stopped_program = ''     # ... to this program, '' = its name not known yet
+        self.commanded = None         # the last command from anybody else
+        self.resume = None            # owed before a respawn: only ever a warning
+        self.resume_t = None
+        self.seen = set()             # which program inputs have spoken
+        self.inside = False
+        self.last_off = None
+        self.on_t = None              # time of the last True
+        self.last_true = None         # ... for a False that crossed it on the wire
+        self.attempts = 0
+        self.failed = False
+
+    def on_mower(self, status, rpm):
+        self.status, self.rpm = status, int(rpm)
+
+    def on_program(self, busy=None, program=None, stop_reason=None):
+        if busy is not None:
+            self.busy = bool(busy)
+            self.seen.add('busy')
+        if program is not None:
+            self.program = program
+            self.seen.add('program')
+            name = program.strip()
+            if self.stopped and self.stopped_program and name != self.stopped_program:
+                self._forget()        # a True belongs to the program it was taken from
+            elif self.stopped:
+                self.stopped_program = name
+        if stop_reason is not None:
+            self.stop_reason = stop_reason
+            self.seen.add('stop_reason')
+
+    def _mark_stopped(self):
+        self.failed = False
+        self.stopped = True
+        self.stopped_program = self.program.strip()
+
+    def _forget(self):
+        self.stopped = False
+        self.stopped_program = ''
+        self.on_t = None
+        self.attempts = 0
+
+    def on_external(self, value, now=0.0):
+        """Somebody else commanded the blade.  True = answer False right now: a True
+        over the area, or a False that may have crossed our own True on the wire."""
+        self.commanded = bool(value)
+        self._forget()
+        if value:
+            self.failed = False
+        elif self.last_true is not None and now - self.last_true < 1.0:
+            self.last_true = None
+            return True
+        if not value or not self.inside or not self._program_may_run():
+            return False
+        self._mark_stopped()
+        self.last_off = now
+        return True
+
+    def owed(self):
+        """The program a True is owed to, None when there is none."""
+        if self.stopped:
+            return self.stopped_program
+        return None if self.resume is None else self.resume['program']
+
+    def restore(self, saved):
+        """~blade_owed from before a respawn.  Checked in update(), the program
+        inputs have not spoken yet here."""
+        try:
+            self.resume = {'program': str(saved['program']).strip()}
+        except (KeyError, TypeError):
+            self.resume = None
+
+    def _check_resume(self, now):
+        if self.resume_t is None:
+            self.resume_t = now
+        if not {'busy', 'program', 'stop_reason'} <= self.seen or self.status is None:
+            if now - self.resume_t < self.p['owed_wait_s']:
+                return
+            self.resume = None        # no mower_smach: nothing is mowing
+            return
+        owed, self.resume = self.resume, None
+        if (owed['program'] == self.program.strip() and self._program_runs()
+                and not self.stop_reason.strip() and not self.running_fw()):
+            self.failed = True        # visible, and never a True
+
+    def _spinning(self):
+        return self.running_fw() or self.rpm >= self.p['blade_on_rpm']
+
+    def running_fw(self):
+        """The firmware has the motor on.  rpm alone may be a coast-down."""
+        return self.status == 'RUN'
+
+    def may_run(self):
+        return self._program_may_run()
+
+    def _program_may_run(self):
+        return self.busy is None or self.busy or bool(self.program.strip())
+
+    def _program_runs(self):
+        return bool(self.busy) or bool(self.program.strip())
+
+    def update(self, now, inside):
+        """`inside` True/False, None = unknown: stay as we are."""
+        if inside is None:
+            inside = self.inside
+        self.inside = inside
+        out = []
+        if self.resume is not None:
+            self._check_resume(now)
+        if self.failed and (self.running_fw() or not self._program_runs()):
+            self.failed = False       # the blade is back, or nothing is left to mow
+        if inside and self._program_may_run():
+            self.on_t = None
+            self.attempts = 0
+            spinning = self._spinning()
+            if self.running_fw() and self.commanded is not False:
+                self._mark_stopped()   # an on-state this guard stops: a debt
+            if (spinning or self.stopped) and (
+                    self.last_off is None or now - self.last_off >= self.p['blade_period_s']):
+                self.last_off = now
+                out.append(False)
+            return out
+        if not self.stopped:
+            return out
+        if not self._program_runs() or self.stop_reason.strip():
+            self._forget()
+            return out
+        if self.status in MOWER_FAULTS:
+            self.on_t = None          # refused or the mission's own: not an attempt
+            return out
+        if self.on_t is None:
+            if self.last_off is not None and now - self.last_off < self.p['blade_on_gap_s']:
+                return out             # a boundary crossed twice is no reason to cycle
+            self.on_t = self.last_true = now
+            self.attempts += 1
+            out.append(True)
+        elif self.running_fw():
+            self._forget()
+        elif now - self.on_t >= self.p['soft_start_s']:
+            if self.attempts >= self.p['restore_attempts']:
+                self._forget()
+                self.failed = True
+            else:
+                self.on_t = self.last_true = now
+                self.attempts += 1
+                out.append(True)
+        return out
+
+    def state(self, enabled=True):
+        if self.stopped:
+            return 'stopped_by_rule' if self.inside else 'restoring'
+        if self.failed:
+            return 'restore_failed'
+        return 'ok' if enabled else 'disabled'
+
+
+def blade_step(lock, blade, now, inside, publish):
+    """One blade tick.  Publishing under the lock: a mission's False in between
+    cannot be overtaken by a True decided before it."""
+    with lock:
+        commands = blade.update(now, inside)
+        for value in commands:
+            publish(value)
+    return commands
+
+
+def guarded(tick, fail):
+    """An exception in a rospy.Timer ends the timer and leaves the process alive,
+    so nothing would respawn it: `fail` ends the node instead."""
+    def run(evt):
+        try:
+            tick(evt)
+        except Exception as exc:  # noqa: BLE001
+            fail(exc)
+    return run
+
+
+def blade_answer(blade, caller, own, value, now):
+    """A /mower/set_motor_on message.  True = publish False now.  Our own message
+    comes back here too: it changes nothing and is never answered."""
+    if caller == own:
+        return False
+    return blade.on_external(value, now)
+
+
+def first_said(saved):
+    """What ~blade_owed holds at start, so that an owe dropped later is deleted."""
+    try:
+        return [str(saved['program']), 0.0]
+    except (KeyError, TypeError):
+        return [None, 0.0]
+
+
+def rules_loader(warn):
+    """vitulus_mapping.objects.load_rules, None when this install has none."""
+    try:
+        from vitulus_mapping import objects
+    except ImportError as exc:
+        warn('map_rules_guard: no rules from files: %s' % exc)
+        return None
+
+    def load(site):
+        try:
+            return objects.load_rules(site)
+        except Exception as exc:  # noqa: BLE001 - a bad file is `cannot tell`
+            warn('map_rules_guard: rules of %s unreadable: %s' % (site, exc))
+            return None
+    return load
+
+
+def load_footprint(path, warn):
+    import yaml
+    try:
+        with open(path) as handle:
+            return list(yaml.safe_load(handle)['footprint'])
+    except (OSError, KeyError, TypeError, yaml.YAMLError) as exc:
+        warn('map_rules_guard: footprint from %s unreadable (%s), using the built-in one'
+             % (path, exc))
+        return FOOTPRINT
+
+
+def yaw_of(q):
+    return math.atan2(2.0 * (q.w * q.z + q.x * q.y), 1.0 - 2.0 * (q.y * q.y + q.z * q.z))
+
+
+def main():
+    import threading
+
+    import rospy
+    import tf2_ros
+    from std_msgs.msg import Bool, String
+    from vitulus_msgs.msg import Mower
+
+    rospy.init_node('map_rules_guard')
+    params = dict((k, type(v)(rospy.get_param('~' + k, v))) for k, v in DEFAULTS.items())
+    footprint = load_footprint(rospy.get_param('~footprint_file', ''), rospy.logwarn)
+    rules = Rules(footprint, params, warn=rospy.logwarn)
+    feed = RuleFeed(params, warn=rospy.logwarn)
+    blade = Blade(params)
+    saved = rospy.get_param('~blade_owed', None)
+    if saved:
+        blade.restore(saved)
+        rospy.logwarn('map_rules_guard: blade owed from before a restart: %s', saved)
+    lock = threading.Lock()
+    own = rospy.get_name()
+    latest = [[]]             # the rules as decided by the feed
+    applied = [[]]            # the rules in force: latest, or none when disabled
+
+    pub_limit = rospy.Publisher('/cmd_vel_mux/limit', String, queue_size=1)
+    pub_state = rospy.Publisher('/map_rules/state', String, queue_size=1, latch=True)
+    pub_warn = rospy.Publisher('/map_rules/warning', String, queue_size=5)
+    pub_blade = rospy.Publisher('/mower/set_motor_on', Bool, queue_size=1)
+
+    buf = tf2_ros.Buffer()
+    tf2_ros.TransformListener(buf)
+
+    def locked(fn):
+        def wrapped(msg):
+            with lock:
+                fn(msg)
+        return wrapped
+
+    def objects_cb(msg):
+        try:
+            rules.set_dock_points(json.loads(msg.data).get('objects'))
+        except (ValueError, AttributeError, TypeError) as exc:
+            rospy.logwarn('map_rules_guard: bad /map_objects/objects: %s', exc)
+
+    def blade_cmd_cb(msg):
+        hdr = getattr(msg, '_connection_header', None) or {}
+        with lock:
+            answer = blade_answer(blade, hdr.get('callerid'), own, msg.data, time.monotonic())
+        if answer:
+            rospy.logwarn('map_rules_guard: %s from %s: blade off', msg.data,
+                          hdr.get('callerid'))
+            pub_blade.publish(Bool(False))
+
+    owed_said = first_said(saved)
+    load_files = rules_loader(rospy.logwarn)
+
+    def persist_owed(owed, now):
+        if owed == owed_said[0] and (owed is None
+                                     or now - owed_said[1] < params['owed_refresh_s']):
+            return
+        try:
+            if owed is not None:
+                rospy.set_param('~blade_owed', {'program': owed, 'stamp': time.time()})
+            elif rospy.has_param('~blade_owed'):
+                rospy.delete_param('~blade_owed')
+            owed_said[0], owed_said[1] = owed, now
+        except Exception as exc:  # noqa: BLE001 - the limit must go out regardless
+            rospy.logerr('map_rules_guard: could not save the blade state: %s', exc)
+
+    rospy.Subscriber('/map_objects/rules', String,
+                     locked(lambda m: feed.on_rules(m.data)), queue_size=1)
+    rospy.Subscriber('/mapping_manager/status', String,
+                     locked(lambda m: feed.on_status(m.data)), queue_size=1)
+    rospy.Subscriber('/map_objects/objects', String, locked(objects_cb), queue_size=1)
+    rospy.Subscriber('/cmd_vel_mux/active', String,
+                     locked(lambda m: rules.set_human(m.data)), queue_size=5)
+    rospy.Subscriber('/mower/status', Mower,
+                     locked(lambda m: blade.on_mower(m.status, m.moto_rpm)), queue_size=1)
+    rospy.Subscriber('/mower/set_motor_on', Bool, blade_cmd_cb, queue_size=5)
+    rospy.Subscriber('/mower_smach/busy', Bool,
+                     locked(lambda m: blade.on_program(busy=m.data)), queue_size=1)
+    rospy.Subscriber('/mower_smach/active_program', String,
+                     locked(lambda m: blade.on_program(program=m.data or '')), queue_size=1)
+    rospy.Subscriber('/mower_smach/stop_reason', String,
+                     locked(lambda m: blade.on_program(stop_reason=m.data or '')), queue_size=1)
+
+    dock_said = [[]]
+    blade_said = [None]
+    state_said = [None]
+    state_t = [0.0]
+
+    def publish_blade(value):
+        rospy.logwarn('map_rules_guard: blade %s', 'on, left the noblade area' if value
+                      else 'off, noblade area')
+        pub_blade.publish(Bool(value))
+
+    def tick(_evt):
+        now = time.monotonic()
+        enabled = bool(rospy.get_param('~enabled', True))
+        with lock:
+            decided = feed.current(blade.may_run())
+        if decided is not None:
+            latest[0] = decided
+        engaged = bool(rospy.get_param('/cmd_vel_mux/limit_engaged', False)) \
+            if enabled and not feed.decided else False
+        if enabled and not feed.ready(now, load_files, engaged):
+            return                    # a respawn must not release the mux
+        try:
+            tr = buf.lookup_transform('map', 'base_link', rospy.Time(0))
+            t = tr.transform
+            # Dated by the transform itself: the age is what the 1 s is about.
+            when = dated(now, (rospy.Time.now() - tr.header.stamp).to_sec())
+            if when is not None:
+                rules.set_pose(when, t.translation.x, t.translation.y, yaw_of(t.rotation))
+        except (tf2_ros.LookupException, tf2_ros.ConnectivityException,
+                tf2_ros.ExtrapolationException):
+            pass
+        # The geometry runs outside the lock: only this timer changes the rules,
+        # the callbacks set one attribute each.
+        want = latest[0] if enabled else []
+        if want != applied[0]:
+            rules.set_rules(want)
+            applied[0] = want
+        limit = rules.limit(now, stamp=rospy.get_time())
+        inside, near = rules.inside(now)
+        noblade = rules.on_noblade(now)
+        warnings = rules.human_warnings(now)
+        dock = rules.dock_conflicts()
+        blade_step(lock, blade, now, noblade, publish_blade)
+        with lock:
+            state = {'in': inside, 'near': near, 'limit': limit,
+                     'blade': blade.state(enabled), 'dock': dock, 'bad': rules.bad}
+            owed = blade.owed()
+        persist_owed(owed, now)
+        if state['blade'] == 'restore_failed' != blade_said[0]:
+            pub_warn.publish(String(json.dumps(
+                {'type': 'noblade', 'name': '',
+                 'text': 'Blade did not come back after a no-blade area.'})))
+        blade_said[0] = state['blade']
+        pub_limit.publish(String(json.dumps(limit, sort_keys=True)))
+        for warning in warnings:
+            pub_warn.publish(String(json.dumps(warning)))
+        if dock != dock_said[0]:
+            dock_said[0] = dock
+            for name in dock:
+                pub_warn.publish(String(json.dumps(
+                    {'type': 'dock', 'name': name,
+                     'text': 'No-go area %s is in the way of the dock.' % name})))
+        # Also at 1 Hz: the mission takes silence for "no guard" (rule_gate.py).
+        key = dict(state, limit=dict(limit, stamp=None))
+        if key != state_said[0] or now - state_t[0] >= 1.0:
+            state_said[0] = key
+            state_t[0] = now
+            pub_state.publish(String(json.dumps(state, sort_keys=True)))
+
+    def fail(exc):
+        rospy.logfatal('map_rules_guard: tick failed, ending for the respawn: %r', exc)
+        rospy.signal_shutdown('tick failed')
+
+    rospy.Timer(rospy.Duration(1.0 / params['rate_hz']), guarded(tick, fail))
+    rospy.loginfo('map_rules_guard: ready')
+    rospy.spin()
+
+
+if __name__ == '__main__':
+    main()

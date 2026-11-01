@@ -68,7 +68,13 @@ roslaunch vitulus_safety safety.launch
 | `~motor_check_rate` | float | 5.0 | Motor check frequency (Hz) |
 | `~startup_grace` | float | 10.0 | Grace period after start (seconds) |
 | `~motor_max_temp` | float | 70.0 | Max drive motor temperature (°C) |
-| `~mower_max_temp` | float | 70.0 | Max mower motor temperature (°C) |
+| `~mower_max_temp` | float | 70.0 | Max mower motor temperature (°C), held for `~mower_temp_sustain_s` |
+| `~mower_cool_temp` | float | 55.0 | Monitor re-arms at or below this (°C) |
+| `~mower_hard_temp` | float | 100.0 | Trips after `~mower_temp_hard_s` (1.5 s) |
+| `~mower_temp_sustain_s` | float | 3.0 | Seconds of consecutive samples above the limit |
+| `~mower_temp_max_rate_c_s` | float | 5.0 | Faster change is recorded as a sensor spike |
+| `~mower_temp_valid_min` / `_max` | float | -30 / 150 | Outside for `~mower_temp_fault_s` (3 s): sensor fault |
+| `~mower_temp_log` | string | `~/.vitulus/safety/mower_temp_events.jsonl` | Event log, 2 min of samples per event |
 | `~alarm_melody` | int | 4 | Melody ID for power module buzzer |
 
 ## Safety Actions
@@ -77,7 +83,10 @@ roslaunch vitulus_safety safety.launch
 |-----------|--------|
 | Drive motor timeout / fault / no data | All motors OFF + alarm |
 | Drive motor temperature > `motor_max_temp` | All motors OFF + alarm |
-| Mower motor temperature > `mower_max_temp` | Mower OFF |
+| Mower motor temperature > `mower_max_temp` for 3 s, or > `mower_hard_temp` for 1.5 s | Mower OFF, `/safety/mower_temp` state `overtemp` |
+| Mower temperature jump too fast for the motor | Warning and event log, no stop |
+| Mower rpm outside 0..`~mower_rpm_max` (7000) | Warning and event log, no stop |
+| Mower temperature out of range or NaN for 3 s | Mower OFF + alarm, state `sensor_fault` |
 | IMU tilt exceeds `max_tilt_x` or `max_tilt_y` | Mower OFF (auto-recovers when tilt returns to normal) |
 
 ## Configuration
