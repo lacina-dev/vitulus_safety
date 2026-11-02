@@ -553,5 +553,35 @@ class Geometry(unittest.TestCase):
         self.assertTrue(math.isclose(v * 0.4 + v * v / 0.5, 0.5))
 
 
+class LinkDebt(unittest.TestCase):
+    """2. 11.: mower_link's False in a ladder must not cancel what the guard owes."""
+
+    def blade(self):
+        b = g.Blade({})
+        b.stopped = True
+        b.stopped_program = 'Mow'
+        return b
+
+    def test_the_links_false_keeps_the_debt(self):
+        b = self.blade()
+        g.blade_answer(b, g.SMACH_CALLERID, '/g', False, 1.0, link_active=True)
+        self.assertEqual(b.owed(), 'Mow')
+
+    def test_the_missions_false_still_ends_it(self):
+        b = self.blade()
+        g.blade_answer(b, g.SMACH_CALLERID, '/g', False, 1.0, link_active=False)
+        self.assertIsNone(b.owed())
+
+    def test_another_nodes_false_ends_it_in_a_ladder_too(self):
+        b = self.blade()
+        g.blade_answer(b, '/ds4/node_ds4', '/g', False, 1.0, link_active=True)
+        self.assertIsNone(b.owed())
+
+    def test_link_active(self):
+        self.assertTrue(g.link_active({'phase': 'resync'}, 10.0, 12.0))
+        self.assertTrue(g.link_active({'phase': 'gap'}, 10.0, 12.0))     # N3
+        self.assertFalse(g.link_active({'phase': None}, 10.0, 12.0))
+        self.assertFalse(g.link_active({'phase': 'resync'}, 10.0, 16.0))
+
 if __name__ == '__main__':
     unittest.main()

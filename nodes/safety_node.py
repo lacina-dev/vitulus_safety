@@ -247,6 +247,8 @@ class SafetyMonitor:
                 '~mower_temp_log', '~/.vitulus/safety/mower_temp_events.jsonl')),
             warn=lambda text: rospy.logwarn('[safety] %s', text))
         self.status_gap_s = rospy.get_param('~mower_status_gap_s', 2.0)
+        self.status_silent_s = rospy.get_param('~mower_status_silent_s', 5.0)
+        self.status_silent_said = False
         self.mower_rpm_max = rospy.get_param('~mower_rpm_max', 7000)
 
         # State
@@ -302,7 +304,7 @@ class SafetyMonitor:
 
         # Timer for periodic motor check
         rospy.Timer(rospy.Duration(1.0 / self.motor_check_rate), self.check_motors)
-        rospy.Timer(rospy.Duration(1.0), lambda _evt: self.temp_ring.flush(time.time()))
+        rospy.Timer(rospy.Duration(1.0), self.temp_ring_tick)
 
         rospy.loginfo("[safety] Safety monitor started. max_tilt_x=%.1f, max_tilt_y=%.1f, "
                       "motor_timeout=%.1f, startup_grace=%.1f, motor_max_temp=%.1f, mower_max_temp=%.1f",
@@ -392,11 +394,24 @@ class SafetyMonitor:
         self.pub_motor_power.publish(Bool(data=False))
         self.pub_alarm.publish(Int16(data=self.alarm_melody))
 
+    def temp_ring_tick(self, _evt):
+        """1. 11. 2026: the status ended at 21:35:06 and never came back, so the
+        status_gap below was never written and the last two minutes were lost."""
+        now = time.time()
+        self.temp_ring.flush(now)
+        if (self.mower_status_t is not None and not self.status_silent_said
+                and now - self.mower_status_t >= self.status_silent_s):
+            self.status_silent_said = True
+            self.temp_ring.event(now, 'status_silent', {
+                'silent_s': round(now - self.mower_status_t, 1),
+                'status': self.mower_status_last})
+
     def mower_status_cb(self, msg):
         """Mower motor temperature: see MowerTempGuard."""
         now = time.time()
         gap = None if self.mower_status_t is None else now - self.mower_status_t
         self.mower_status_t = now
+        self.status_silent_said = False
         self.temp_ring.add(now, {
             'seq': msg.header.seq, 'status': msg.status, 'temp': round(msg.temp, 2),
             'rpm': msg.moto_rpm, 'setpoint': msg.setpoint_rpm,

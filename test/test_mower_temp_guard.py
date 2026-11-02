@@ -36,6 +36,34 @@ def steady(temp, start, seconds, hz=2.0):
     return [(start + i / hz, temp) for i in range(int(seconds * hz) + 1)]
 
 
+class Silent(unittest.TestCase):
+    """The ring goes to disk when the status ends, not only when it comes back."""
+
+    def _node(self, tmp):
+        node = sn.SafetyMonitor.__new__(sn.SafetyMonitor)
+        node.temp_ring = sn.TempRing(os.path.join(tmp, 'e.jsonl'))
+        node.status_silent_s = 5.0
+        node.status_silent_said = False
+        node.mower_status_last = 'RUN'
+        node.mower_status_t = None
+        return node
+
+    def test_written_once_with_what_came_before(self):
+        tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, tmp)
+        node = self._node(tmp)
+        node.temp_ring_tick(None)
+        self.assertFalse(os.path.exists(node.temp_ring.path))     # never spoke: says nothing
+        node.temp_ring.add(sn.time.time() - 7.0, {'status': 'RUN', 'rpm': 3389})
+        node.mower_status_t = sn.time.time() - 6.0
+        node.temp_ring_tick(None)
+        node.temp_ring_tick(None)
+        rows = [json.loads(line) for line in open(node.temp_ring.path)]
+        self.assertEqual([r['event'] for r in rows], ['status_silent'])
+        self.assertEqual(rows[0]['before'][-1]['rpm'], 3389)
+        self.assertEqual(rows[0]['detail']['status'], 'RUN')
+
+
 class Guard(unittest.TestCase):
 
     def test_incident_is_a_spike_not_a_stop(self):

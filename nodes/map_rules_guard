@@ -700,10 +700,21 @@ def guarded(tick, fail):
     return run
 
 
-def blade_answer(blade, caller, own, value, now):
+SMACH_CALLERID = '/node_mower_smach'
+
+
+def link_active(state, heard, now, fresh_s=3.0):
+    """mower_link has the blade: /mower_smach/link, repeated while it does.  The gap
+    counts: a False sent at its end, or into it, is no decision about the blade."""
+    return bool((state or {}).get('phase')) and now - heard <= fresh_s
+
+
+def blade_answer(blade, caller, own, value, now, link_active=False, smach=SMACH_CALLERID):
     """A /mower/set_motor_on message.  True = publish False now.  Our own message
-    comes back here too: it changes nothing and is never answered."""
-    if caller == own:
+    comes back here too: it changes nothing and is never answered.  The False of a
+    ladder has the mission's callerid and is no decision about the blade: what this
+    guard owes stays owed."""
+    if caller == own or (link_active and caller == smach and not value):
         return False
     return blade.on_external(value, now)
 
@@ -775,6 +786,7 @@ def main():
     pub_state = rospy.Publisher('/map_rules/state', String, queue_size=1, latch=True)
     pub_warn = rospy.Publisher('/map_rules/warning', String, queue_size=5)
     pub_blade = rospy.Publisher('/mower/set_motor_on', Bool, queue_size=1)
+    smach = rospy.get_param('~smach_callerid', SMACH_CALLERID)
 
     buf = tf2_ros.Buffer()
     tf2_ros.TransformListener(buf)
@@ -791,10 +803,22 @@ def main():
         except (ValueError, AttributeError, TypeError) as exc:
             rospy.logwarn('map_rules_guard: bad /map_objects/objects: %s', exc)
 
+    link = {'state': None, 't': 0.0}
+
+    def link_cb(msg):
+        try:
+            state = json.loads(msg.data)
+        except ValueError:
+            return
+        with lock:
+            link['state'], link['t'] = state, time.monotonic()
+
     def blade_cmd_cb(msg):
         hdr = getattr(msg, '_connection_header', None) or {}
         with lock:
-            answer = blade_answer(blade, hdr.get('callerid'), own, msg.data, time.monotonic())
+            now = time.monotonic()
+            answer = blade_answer(blade, hdr.get('callerid'), own, msg.data, now,
+                                  link_active(link['state'], link['t'], now), smach)
         if answer:
             rospy.logwarn('map_rules_guard: %s from %s: blade off', msg.data,
                           hdr.get('callerid'))
@@ -826,6 +850,7 @@ def main():
     rospy.Subscriber('/mower/status', Mower,
                      locked(lambda m: blade.on_mower(m.status, m.moto_rpm)), queue_size=1)
     rospy.Subscriber('/mower/set_motor_on', Bool, blade_cmd_cb, queue_size=5)
+    rospy.Subscriber('/mower_smach/link', String, link_cb, queue_size=2)
     rospy.Subscriber('/mower_smach/busy', Bool,
                      locked(lambda m: blade.on_program(busy=m.data)), queue_size=1)
     rospy.Subscriber('/mower_smach/active_program', String,
