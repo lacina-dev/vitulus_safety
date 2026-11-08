@@ -21,7 +21,7 @@ Motion, /cmd_vel_mux/limit at 5 Hz:
          on the turn with the most room.
   map->base_link older than ~tf_max_age_s, or a nogo that cannot be read, with
   rules present: all zero.
-No rules: `rules: 0` and nothing else, no blade command ever.
+No rules: `rules: 0`, and the blade only for the zone fence below.
 
 Rules in force (`RuleFeed`): nothing goes out until the first /map_objects/rules,
 or ~no_publisher_s after the start whoever is connected: then the served site's
@@ -44,7 +44,7 @@ TEMP/ERR/BLOCKED the firmware refuses or handles it: the True waits.  Not within
 another node on the area is answered at once, the 1 Hz is the periodic re-assert.
 A True owed before a respawn is never sent: nobody saw what the mission did
 meanwhile, and the blade is not started on what cannot be verified.  Rosparam
-~blade_owed {program, stamp} exists only to say so: the same program still runs
+~blade_owed {program, zone, stamp} exists only to say so: the same program still runs
 without a blade -> `restore_failed` and a warning, the mission carries on.  The
 off side needs no memory, it works from what is seen after the restart.
 
@@ -52,13 +52,39 @@ Dock: a nogo in the corridor UNDOCK-DOCK-DOCKED (footprint + stop margin) will
 stop the approach.  That is not hidden: warning + state `dock`, and the docking
 watchdog ends the stage with its stall reason.
 
+Zone fence (`ZoneFence`): the blade cuts only in the zone the program mows.
+/mower_smach/active_zone (latched JSON {program, zone, points} in map, {} between
+zones) says which one.  While a program runs, the robot centre more than
+~zone_edge_m outside that zone for ~zone_hold_s counts as a noblade area, with
+the whole `Blade` logic above: off, and on again after it came back within
+~zone_edge_m - ~zone_hysteresis_m.  The edge band is from the mow trail of the
+Bigger runs (1.-7. 11. 2026): on the planned path the centre was at most 6 cm
+outside, the transits between paths went 2.8 m out with the blade on.  Driving
+outside stays allowed, only the blade stops.  No zone, a zone that cannot be
+read or ~zone_fence false (read every tick): nothing changes.  State `zone` {name, program,
+outside, out_m}, null without a zone; `held_by` zone|noblade while a True is owed.
+Differences to a noblade area:
+  - the True waits ~zone_on_gap_s (1 s), not ~blade_on_gap_s: the gap stops a
+    blade cycling on a boundary, here the hysteresis and the hold do that already,
+    and the robot stands at the edge until the blade is up (rule_gate.py in
+    vitulus_navi), so every second of gap is a second of standing.  People are
+    not the point of the fence: STOP, the tilt guard and the firmware are.
+  - the zone changes or ends (mission's safe_blade_shutdown, also when its {}
+    overtakes its False): the debt is dropped, never a True behind a zone.
+  - a respawn outside the zone with a debt of the same program and the same zone
+    (~blade_owed {program, zone, stamp}) is a stop by the fence (`stopped_by_rule`),
+    not `restore_failed`: the True comes in the zone.  The decision waits for the
+    first /mower_smach/active_zone too (latched, subscribed first).
+  - a noblade area inside the zone on the way back does not turn a fence stop into
+    a noblade one: leaving it is the same as coming back into the zone.
+
 ~enabled false: `rules: 0`, the blade is handed back, read every tick.
 
   in  /map_objects/rules, /map_objects/objects (dock points), /cmd_vel_mux/active,
       /mower/status, /mower/set_motor_on (others' commands), /mower_smach/busy,
-      /mower_smach/active_program, /mower_smach/stop_reason
+      /mower_smach/active_program, /mower_smach/stop_reason, /mower_smach/active_zone
   out /cmd_vel_mux/limit, /mower/set_motor_on,
-      /map_rules/state (latched JSON {"in", "near", "limit", "blade", "dock"})
+      /map_rules/state (latched JSON {"in", "near", "limit", "blade", "dock", "zone"})
       /map_rules/warning (JSON {"type", "name", "text"})
 """
 import json
@@ -66,7 +92,7 @@ import math
 import time
 
 from shapely import make_valid
-from shapely.geometry import LineString, MultiPolygon, Polygon
+from shapely.geometry import LineString, MultiPolygon, Point, Polygon
 from shapely.ops import unary_union
 
 SOURCE = 'map_rules'
@@ -89,6 +115,8 @@ DEFAULTS = {
     'blade_on_rpm': 300, 'blade_period_s': 1.0, 'soft_start_s': 6.0, 'restore_attempts': 3,
     'owed_refresh_s': 5.0, 'owed_wait_s': 3.0, 'blade_on_gap_s': 3.0, 'no_publisher_s': 5.0,
     'file_reload_s': 5.0,
+    'zone_fence': True, 'zone_edge_m': 0.15, 'zone_hysteresis_m': 0.03, 'zone_hold_s': 0.2,
+    'zone_on_gap_s': 1.0,
 }
 MIN_STEP = 0.01
 TOUCH = 1e-4
@@ -511,6 +539,92 @@ class Rules(object):
         return sorted(r.name for r in self.rules if r.type == 'nogo' and lane.intersects(r.poly))
 
 
+class ZoneFence(object):
+    """Is the robot outside the zone the program mows?  Pure.  The centre counts,
+    not the footprint: mowing the edge puts half the deck over it."""
+
+    def __init__(self, params=None, warn=None):
+        self.p = dict(DEFAULTS)
+        self.p.update(params or {})
+        self.warn = warn or (lambda text: None)
+        self.name = ''
+        self.program = ''
+        self.poly = None
+        self.out = False
+        self.since = None             # first tick beyond the edge band
+        self.out_m = None
+
+    def set_zone(self, raw):
+        """/mower_smach/active_zone.  {} or '' = between zones: no fence.  True when
+        the zone changed (another one, or none any more)."""
+        try:
+            msg = json.loads(raw) if raw else {}
+            if not isinstance(msg, dict):
+                raise ValueError('not an object')
+            if msg.get('frame') not in (None, '', 'map'):
+                raise ValueError('frame %s, not map' % msg.get('frame'))
+            points = msg.get('points')
+            poly = area_of(points) if points else None
+        except Exception as exc:  # noqa: BLE001 - GEOS raises its own
+            self.warn('map_rules_guard: active zone unusable, no zone fence: %s' % exc)
+            msg, poly = {}, None
+        name = str(msg.get('zone') or '') if poly is not None else ''
+        changed = name != self.name or (poly is None) != (self.poly is None)
+        if changed or poly is None:
+            self.reset()
+        self.name = name
+        self.program = str(msg.get('program') or '') if poly is not None else ''
+        self.poly = poly
+        return changed
+
+    def reset(self):
+        self.out = False
+        self.since = None
+        self.out_m = None
+
+    def outside_by(self, x, y):
+        """Metres the point is outside the zone, 0 inside."""
+        return self.poly.distance(Point(x, y))
+
+    def update(self, now, pose):
+        """True/False, None when the pose is not known or the hold still runs (the
+        caller keeps the last).  `pose` (x, y) or None."""
+        if self.poly is None:
+            self.reset()
+            return False
+        if pose is None:
+            return None
+        self.out_m = self.outside_by(pose[0], pose[1])
+        edge = self.p['zone_edge_m']
+        if self.out:
+            if self.out_m <= edge - self.p['zone_hysteresis_m'] + 1e-6:
+                self.out = False
+                self.since = None
+        elif self.out_m > edge + 1e-6:
+            if self.since is None:
+                self.since = now
+            if now - self.since >= self.p['zone_hold_s'] - 1e-6:
+                self.out = True
+            else:
+                return None           # within the hold: not decided yet
+        else:
+            self.since = None
+        return self.out
+
+    def item(self):
+        if self.poly is None:
+            return None
+        return {'name': self.name, 'program': self.program, 'outside': self.out,
+                'out_m': None if self.out_m is None else round(self.out_m, 2)}
+
+
+def any_true(*flags):
+    """Over noblade and the zone fence: True wins, then None (unknown), else False."""
+    if any(f is True for f in flags):
+        return True
+    return None if any(f is None for f in flags) else False
+
+
 class Blade(object):
     """When the guard says False or True.  Pure.  `update` returns the commands."""
 
@@ -529,7 +643,11 @@ class Blade(object):
         self.resume_t = None
         self.seen = set()             # which program inputs have spoken
         self.inside = False
-        self.last_off = None
+        self.last_off = None          # the last False, the 1 Hz period counts from it
+        self.off_since = None         # the first False of this stop, the on-gap counts from it
+        self.by_zone = False          # the debt is the zone fence's, not a noblade area's
+        self.cause_zone = False       # this tick's stop is the fence's (the log line)
+        self.zone_name = ''           # /mower_smach/active_zone, '' none
         self.on_t = None              # time of the last True
         self.last_true = None         # ... for a False that crossed it on the wire
         self.attempts = 0
@@ -554,12 +672,17 @@ class Blade(object):
             self.stop_reason = stop_reason
             self.seen.add('stop_reason')
 
+    def on_zone(self, name):
+        self.zone_name = name or ''
+        self.seen.add('zone')
+
     def _mark_stopped(self):
         self.failed = False
         self.stopped = True
         self.stopped_program = self.program.strip()
 
     def _forget(self):
+        self.off_since = None
         self.stopped = False
         self.stopped_program = ''
         self.on_t = None
@@ -579,6 +702,8 @@ class Blade(object):
             return False
         self._mark_stopped()
         self.last_off = now
+        if self.off_since is None:
+            self.off_since = now
         return True
 
     def owed(self):
@@ -594,11 +719,23 @@ class Blade(object):
             self.resume = {'program': str(saved['program']).strip()}
         except (KeyError, TypeError):
             self.resume = None
+            return
+        if 'zone' in saved:       # this format: the zone is part of the decision
+            self.resume['zone'] = str(saved.get('zone') or '')
+
+    def owed_zone(self):
+        """The zone a fence debt belongs to, '' for a noblade one or none."""
+        if self.stopped:
+            return self.zone_name if self.by_zone else ''
+        return '' if self.resume is None else self.resume.get('zone', '')
 
     def _check_resume(self, now):
         if self.resume_t is None:
             self.resume_t = now
-        if not {'busy', 'program', 'stop_reason'} <= self.seen or self.status is None:
+        need = {'busy', 'program', 'stop_reason'}
+        if 'zone' in self.resume:
+            need.add('zone')
+        if not need <= self.seen or self.status is None:
             if now - self.resume_t < self.p['owed_wait_s']:
                 return
             self.resume = None        # no mower_smach: nothing is mowing
@@ -606,6 +743,11 @@ class Blade(object):
         owed, self.resume = self.resume, None
         if (owed['program'] == self.program.strip() and self._program_runs()
                 and not self.stop_reason.strip() and not self.running_fw()):
+            if (self.inside and self.by_zone and owed.get('zone')
+                    and owed['zone'] == self.zone_name):
+                self._mark_stopped()  # outside the zone: the fence's stop, True back in it
+                self.off_since = now
+                return
             self.failed = True        # visible, and never a True
 
     def _spinning(self):
@@ -624,10 +766,26 @@ class Blade(object):
     def _program_runs(self):
         return bool(self.busy) or bool(self.program.strip())
 
-    def update(self, now, inside):
-        """`inside` True/False, None = unknown: stay as we are."""
+    def program_runs(self):
+        return self._program_runs()
+
+    def zone_changed(self):
+        """The mission's zone ended or another began: a debt of the fence is dropped,
+        there is no zone to come back to."""
+        if self.stopped and self.by_zone:
+            self._forget()
+
+    def update(self, now, inside, by_zone=False):
+        """`inside` True/False, None = unknown: stay as we are.  `by_zone` the zone
+        fence holds it, not a noblade area."""
         if inside is None:
+            if self.resume is not None:
+                return []             # a debt from before a respawn waits for the pose
             inside = self.inside
+        elif inside:
+            self.cause_zone = bool(by_zone)
+            # A noblade area on the way back into the zone keeps a fence stop one.
+            self.by_zone = bool(by_zone) or (self.stopped and self.by_zone)
         self.inside = inside
         out = []
         if self.resume is not None:
@@ -643,6 +801,8 @@ class Blade(object):
             if (spinning or self.stopped) and (
                     self.last_off is None or now - self.last_off >= self.p['blade_period_s']):
                 self.last_off = now
+                if self.off_since is None:
+                    self.off_since = now
                 out.append(False)
             return out
         if not self.stopped:
@@ -654,8 +814,13 @@ class Blade(object):
             self.on_t = None          # refused or the mission's own: not an attempt
             return out
         if self.on_t is None:
-            if self.last_off is not None and now - self.last_off < self.p['blade_on_gap_s']:
-                return out             # a boundary crossed twice is no reason to cycle
+            # A boundary crossed twice is no reason to cycle.  From the first False
+            # of the stop: the 1 Hz re-asserts would add up to 3 s unmown behind it.
+            off = self.off_since if self.off_since is not None else self.last_off
+            gap = self.p['zone_on_gap_s' if self.by_zone else 'blade_on_gap_s']
+            if off is not None and now - off < gap:
+                return out
+            self.off_since = None
             self.on_t = self.last_true = now
             self.attempts += 1
             out.append(True)
@@ -671,6 +836,11 @@ class Blade(object):
                 out.append(True)
         return out
 
+    def held_by(self):
+        if not self.stopped:
+            return None
+        return 'zone' if self.by_zone else 'noblade'
+
     def state(self, enabled=True):
         if self.stopped:
             return 'stopped_by_rule' if self.inside else 'restoring'
@@ -679,11 +849,18 @@ class Blade(object):
         return 'ok' if enabled else 'disabled'
 
 
-def blade_step(lock, blade, now, inside, publish):
+def blade_text(value, by_zone, zone):
+    """The log line of a guard command."""
+    if by_zone:
+        return ('on, back in the zone %s' if value else 'off, outside the zone %s') % zone
+    return 'on, left the noblade area' if value else 'off, noblade area'
+
+
+def blade_step(lock, blade, now, inside, publish, by_zone=False):
     """One blade tick.  Publishing under the lock: a mission's False in between
     cannot be overtaken by a True decided before it."""
     with lock:
-        commands = blade.update(now, inside)
+        commands = blade.update(now, inside, by_zone)
         for value in commands:
             publish(value)
     return commands
@@ -773,6 +950,7 @@ def main():
     rules = Rules(footprint, params, warn=rospy.logwarn)
     feed = RuleFeed(params, warn=rospy.logwarn)
     blade = Blade(params)
+    fence = ZoneFence(params, warn=rospy.logwarn)
     saved = rospy.get_param('~blade_owed', None)
     if saved:
         blade.restore(saved)
@@ -825,21 +1003,31 @@ def main():
             pub_blade.publish(Bool(False))
 
     owed_said = first_said(saved)
+    owed_said.append(str((saved or {}).get('zone') or '') if isinstance(saved, dict) else '')
     load_files = rules_loader(rospy.logwarn)
 
-    def persist_owed(owed, now):
-        if owed == owed_said[0] and (owed is None
-                                     or now - owed_said[1] < params['owed_refresh_s']):
+    def persist_owed(owed, zone, now):
+        if owed == owed_said[0] and zone == owed_said[2] and (
+                owed is None or now - owed_said[1] < params['owed_refresh_s']):
             return
         try:
             if owed is not None:
-                rospy.set_param('~blade_owed', {'program': owed, 'stamp': time.time()})
+                rospy.set_param('~blade_owed', {'program': owed, 'zone': zone,
+                                                'stamp': time.time()})
             elif rospy.has_param('~blade_owed'):
                 rospy.delete_param('~blade_owed')
-            owed_said[0], owed_said[1] = owed, now
+            owed_said[0], owed_said[1], owed_said[2] = owed, now, zone
         except Exception as exc:  # noqa: BLE001 - the limit must go out regardless
             rospy.logerr('map_rules_guard: could not save the blade state: %s', exc)
 
+    def zone_cb(msg):
+        if fence.set_zone(msg.data):
+            blade.zone_changed()
+        blade.on_zone(fence.name)
+
+    # First: a debt from before a respawn waits for the zone, the latched zone
+    # should not be the last input to arrive.
+    rospy.Subscriber('/mower_smach/active_zone', String, locked(zone_cb), queue_size=1)
     rospy.Subscriber('/map_objects/rules', String,
                      locked(lambda m: feed.on_rules(m.data)), queue_size=1)
     rospy.Subscriber('/mapping_manager/status', String,
@@ -864,13 +1052,14 @@ def main():
     state_t = [0.0]
 
     def publish_blade(value):
-        rospy.logwarn('map_rules_guard: blade %s', 'on, left the noblade area' if value
-                      else 'off, noblade area')
+        rospy.logwarn('map_rules_guard: blade %s', blade_text(
+            value, blade.by_zone if value else blade.cause_zone, fence.name))
         pub_blade.publish(Bool(value))
 
     def tick(_evt):
         now = time.monotonic()
         enabled = bool(rospy.get_param('~enabled', True))
+        fence_on = bool(rospy.get_param('~zone_fence', params['zone_fence']))
         with lock:
             decided = feed.current(blade.may_run())
         if decided is not None:
@@ -898,14 +1087,23 @@ def main():
         limit = rules.limit(now, stamp=rospy.get_time())
         inside, near = rules.inside(now)
         noblade = rules.on_noblade(now)
+        with lock:
+            fenced = enabled and fence_on and blade.program_runs()
+            if not fenced:
+                fence.reset()
+            pose = rules.pose[1:3] if rules.fresh(now) else None
+            out = fence.update(now, pose) if fenced else False
+            zone = fence.item() if fenced else None
         warnings = rules.human_warnings(now)
         dock = rules.dock_conflicts()
-        blade_step(lock, blade, now, noblade, publish_blade)
+        blade_step(lock, blade, now, any_true(noblade, out), publish_blade,
+                   by_zone=out is True and noblade is not True)
         with lock:
             state = {'in': inside, 'near': near, 'limit': limit,
-                     'blade': blade.state(enabled), 'dock': dock, 'bad': rules.bad}
-            owed = blade.owed()
-        persist_owed(owed, now)
+                     'blade': blade.state(enabled), 'dock': dock, 'bad': rules.bad,
+                     'zone': zone, 'held_by': blade.held_by()}
+            owed, owed_zone = blade.owed(), blade.owed_zone()
+        persist_owed(owed, owed_zone, now)
         if state['blade'] == 'restore_failed' != blade_said[0]:
             pub_warn.publish(String(json.dumps(
                 {'type': 'noblade', 'name': '',
